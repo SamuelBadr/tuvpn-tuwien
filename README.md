@@ -59,4 +59,4 @@ tuvpn logs            Recent OpenConnect output
 
 ## Notes
 
-- Default account is `you@tuwien.ac.at`; override with `TUWIEN_CUID`.
+- `TUWIEN_CUID` is required; no built-in default account.

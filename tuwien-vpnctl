@@ -7,7 +7,11 @@ export PATH
 # This file is root-owned and is the only privileged control plane used by the
 # user-facing CLI and watchdog. Keep all executable paths fixed and root-owned.
 
-readonly USER_EMAIL="${TUWIEN_CUID:-you@tuwien.ac.at}"
+readonly USER_EMAIL="${TUWIEN_CUID:-}"
+
+require_cuid() {
+  [[ -n "$USER_EMAIL" ]] || { echo 'Set TUWIEN_CUID to your TU Wien account (e.g. me@tuwien.ac.at).' >&2; return 1; }
+}
 readonly PASS_SERVICE='TUWien VPN Password'
 readonly TOTP_SERVICE='TUWien VPN TOTP Seed'
 readonly AUTHGROUP='1_TU_getunnelt'
@@ -424,6 +428,7 @@ logs_impl() {
 
 openconnect_cmd() {
   local pass seed token_secret rc
+  require_cuid || return 1
   if ! pass=$(/usr/bin/security find-generic-password -w -a "$USER_EMAIL" -s "$PASS_SERVICE" 2>/dev/null); then
     if /usr/bin/security find-generic-password -a "$USER_EMAIL" -s "$PASS_SERVICE" >/dev/null 2>&1; then
       log 'TUvpn: login Keychain is locked. Unlock it from the login screen or Keychain Access, then reconnect.'
@@ -773,6 +778,7 @@ doctor() {
   echo "vpnc_script=$([[ -x "$VPNC_SCRIPT" ]] && echo present || echo missing)"
   echo "vpnc_script_owner=${script_owner:-unknown}"
   echo "vpnc_script_mode=${script_mode:-unknown}"
+  require_cuid || return 1
   echo "password_keychain=$(/usr/bin/security find-generic-password -a "$USER_EMAIL" -s "$PASS_SERVICE" >/dev/null 2>&1 && echo present || echo missing)"
   echo "totp_keychain=$(/usr/bin/security find-generic-password -a "$USER_EMAIL" -s "$TOTP_SERVICE" >/dev/null 2>&1 && echo present || echo missing)"
   echo "server_reachable=$(server_reachable && echo yes || echo no)"
