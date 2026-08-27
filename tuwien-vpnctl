@@ -7,15 +7,6 @@ export PATH
 # This file is root-owned and is the only privileged control plane used by the
 # user-facing CLI and watchdog. Keep all executable paths fixed and root-owned.
 
-USER_EMAIL="${TUWIEN_CUID:-}"   # not readonly: may be filled interactively by require_cuid
-
-require_cuid() {
-  [[ -n "$USER_EMAIL" ]] && return 0
-  read -r -p 'TU Wien account (e.g. me@tuwien.ac.at): ' USER_EMAIL || true
-  [[ -n "$USER_EMAIL" ]]
-}
-readonly PASS_SERVICE='TUWien VPN Password'
-readonly TOTP_SERVICE='TUWien VPN TOTP Seed'
 readonly AUTHGROUP='1_TU_getunnelt'
 readonly HOST='vpn.tuwien.ac.at'
 readonly OPENCONNECT='/usr/local/libexec/tuwien-openconnect-9.21/bin/openconnect'
@@ -93,12 +84,25 @@ with_lock() {
     if (( elapsed >= LOCK_TIMEOUT )); then
       # A lock still held past the timeout by a watchdog invocation (a transient
       # check that should exit in seconds) is a wedged holder, e.g. stuck in DNS
-      # repair. Break it, or every command would deadlock forever behind it.
+      # repair. Stop it only when we can prove the lock is still its own after it
+      # dies; never remove a lock another process has re-acquired.
       if [[ -n "$lock_pid" ]] \
           && ps -p "$lock_pid" -o command= 2>/dev/null | grep -q 'tuwien-vpnctl watchdog'; then
         log "Lock held by wedged watchdog $lock_pid; stopping it."
         kill -TERM "$lock_pid" 2>/dev/null || true
-        sleep 1
+        for _ in 1 2 3 4 5; do
+          ps -p "$lock_pid" >/dev/null 2>&1 || break
+          sleep 1
+        done
+        if ps -p "$lock_pid" >/dev/null 2>&1; then
+          log "Watchdog $lock_pid did not exit; leaving lock in place."
+          return 1
+        fi
+        current_pid=$(tr -d '[:space:]' < "$LOCK_DIR/pid" 2>/dev/null || true)
+        if [[ "$current_pid" != "$lock_pid" ]]; then
+          log "Lock ownership changed (now ${current_pid:-none}); not removing it."
+          return 1
+        fi
         rm -rf "$LOCK_DIR" 2>/dev/null || true
         continue
       fi
@@ -313,7 +317,8 @@ cleanup_stale_gateway_route() {
 repair_dns() {
   clear_vpn_dns_state stale
   restore_dns_snapshot_or_fallback
-  networksetup -setsearchdomains "$(primary_service)" empty >/dev/null 2>&1 || true
+  # Deliberately not touching search domains: this script never sets them, so it
+  # must never clear or restore them either.
   killall -HUP mDNSResponder >/dev/null 2>&1 || true
 }
 
@@ -439,26 +444,55 @@ logs_impl() {
   fi
 }
 
+external_trusted() {
+  # The privileged controller executes these absolute paths as root. Refuse any
+  # install that is not root-owned and not group/world-writable (a user could
+  # otherwise swap them for arbitrary code running as root).
+  local path mode
+  for path in "$OPENCONNECT" "$VPNC_SCRIPT"; do
+    if [[ ! -x "$path" ]]; then
+      log "Missing or not executable: $path"
+      return 1
+    fi
+    if [[ "$(stat -f '%u' "$path" 2>/dev/null || echo x)" != 0 ]]; then
+      log "Not root-owned, refusing: $path"
+      return 1
+    fi
+    mode=$(stat -f '%Lp' "$path" 2>/dev/null || echo 0)
+    mode=${mode//[!0-7]/0}
+    if (( (8#$mode & 022) != 0 )); then
+      log "Group/world-writable, refusing: $path"
+      return 1
+    fi
+  done
+  return 0
+}
+
+verify_split_tunnel() {
+  # The one property this tool promises: TU traffic via the tunnel, everything
+  # else via the physical network. A couple of route-table reads, no framework.
+  local iface_tu iface_public
+  iface_tu=$(route -n get "$VPN_DNS_IP" 2>/dev/null | awk -F': ' '/interface:/{print $2; exit}')
+  iface_public=$(route -n get 1.1.1.1 2>/dev/null | awk -F': ' '/interface:/{print $2; exit}')
+  if [[ "$iface_tu" =~ ^utun[0-9]+$ ]] && [[ ! "$iface_public" =~ ^utun[0-9]+$ ]]; then
+    return 0
+  fi
+  log "Split-tunnel invariant failed (TU via ${iface_tu:-none}, public via ${iface_public:-none}); disconnecting."
+  return 1
+}
+
 openconnect_cmd() {
   local pass seed token_secret rc
-  require_cuid || return 1
-  if ! pass=$(/usr/bin/security find-generic-password -w -a "$USER_EMAIL" -s "$PASS_SERVICE" 2>/dev/null); then
-    if /usr/bin/security find-generic-password -a "$USER_EMAIL" -s "$PASS_SERVICE" >/dev/null 2>&1; then
-      log 'TUvpn: login Keychain is locked. Unlock it from the login screen or Keychain Access, then reconnect.'
-    else
-      log 'TUvpn: network password not found in Keychain. Run: tuvpn doctor'
-    fi
-    return 1
-  fi
-  if ! seed=$(/usr/bin/security find-generic-password -w -a "$USER_EMAIL" -s "$TOTP_SERVICE" 2>/dev/null); then
-    unset pass
-    if /usr/bin/security find-generic-password -a "$USER_EMAIL" -s "$TOTP_SERVICE" >/dev/null 2>&1; then
-      log 'TUvpn: login Keychain is locked. Unlock it from the login screen or Keychain Access, then reconnect.'
-    else
-      log 'TUvpn: TOTP seed not found in Keychain. Run: tuvpn doctor'
-    fi
-    return 1
-  fi
+  # Credentials arrive on stdin (line 1 account, line 2 password, line 3 TOTP
+  # seed), fed by the unprivileged tuvpn wrapper which reads them from the login
+  # Keychain. root never reads the Keychain and secrets never enter argv, the
+  # environment, or any file.
+  IFS= read -r USER_EMAIL || true
+  IFS= read -r pass || true
+  IFS= read -r seed || true
+  [[ -n "$USER_EMAIL" && -n "$pass" && -n "$seed" ]] \
+    || { log 'Missing credentials on stdin (connect via tuvpn, not sudo tuwien-vpnctl).'; return 1; }
+  external_trusted || return 1
 
   # OpenConnect accepts a token secret from a file. /dev/fd/3 keeps the TOTP
   # seed out of both the filesystem and the process argument list.
@@ -477,7 +511,6 @@ openconnect_cmd() {
     --pid-file="$PIDFILE" \
     --reconnect-timeout="$RECONNECT_TIMEOUT" \
     --force-dpd="$DPD_INTERVAL" \
-    --no-dtls \
     --passwd-on-stdin \
     --token-mode=totp \
     --token-secret=@/dev/fd/3 \
@@ -541,6 +574,9 @@ disconnect_impl() {
   cleanup_stale_gateway_route
   clear_vpn_dns_state all
   repair_dns >/dev/null 2>&1 || true
+  # The snapshot covers one connect/disconnect cycle. Drop it after a clean
+  # teardown so a stale snapshot can never be restored onto a later network.
+  rm -f "$DNS_SNAPSHOT_FILE"
 }
 
 wait_for_pidfile() {
@@ -643,6 +679,10 @@ connect_impl() {
 
   if connect_once; then
     watchdog_reset_state
+    if ! verify_split_tunnel; then
+      disconnect_impl >/dev/null 2>&1 || true
+      return 1
+    fi
     return 0
   fi
 
@@ -651,6 +691,10 @@ connect_impl() {
   cleanup_stale_state
   if connect_once; then
     watchdog_reset_state
+    if ! verify_split_tunnel; then
+      disconnect_impl >/dev/null 2>&1 || true
+      return 1
+    fi
     return 0
   fi
 
@@ -791,9 +835,7 @@ doctor() {
   echo "vpnc_script=$([[ -x "$VPNC_SCRIPT" ]] && echo present || echo missing)"
   echo "vpnc_script_owner=${script_owner:-unknown}"
   echo "vpnc_script_mode=${script_mode:-unknown}"
-  require_cuid || return 1
-  echo "password_keychain=$(/usr/bin/security find-generic-password -a "$USER_EMAIL" -s "$PASS_SERVICE" >/dev/null 2>&1 && echo present || echo missing)"
-  echo "totp_keychain=$(/usr/bin/security find-generic-password -a "$USER_EMAIL" -s "$TOTP_SERVICE" >/dev/null 2>&1 && echo present || echo missing)"
+  echo "external_trusted=$(if external_trusted >/dev/null 2>&1; then echo yes; else echo no; fi)"
   echo "server_reachable=$(server_reachable && echo yes || echo no)"
   echo "status=$(status || true)"
 

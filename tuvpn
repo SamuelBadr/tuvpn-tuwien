@@ -5,6 +5,8 @@ export PATH
 
 readonly VPNCTL='/usr/local/sbin/tuwien-vpnctl'
 readonly SUDO='/usr/bin/sudo'
+readonly PASS_SERVICE='TUWien VPN Password'
+readonly TOTP_SERVICE='TUWien VPN TOTP Seed'
 
 usage() {
   cat <<'EOF'
@@ -24,24 +26,56 @@ Commands:
 EOF
 }
 
+account() {
+  [[ -n "${TUWIEN_CUID:-}" ]] && { printf '%s\n' "$TUWIEN_CUID"; return 0; }
+  local acct=""
+  read -r -p 'TU Wien account (e.g. me@tuwien.ac.at): ' acct || true
+  [[ -n "$acct" ]]
+}
+
 run_ctl() {
   [[ -x "$VPNCTL" ]] || { echo "TUvpn controller is not installed: $VPNCTL" >&2; exit 1; }
   "$SUDO" "$VPNCTL" "$@"
 }
 
+# Connect needs secrets from the login Keychain, which only the logged-in user
+# can read, so this wrapper resolves the account and reads password + TOTP seed
+# unprivileged, then feeds them to the privileged controller on stdin. They
+# never appear in argv, the environment, or on disk.
+run_with_creds() {
+  local acct pass seed
+  [[ -x "$VPNCTL" ]] || { echo "TUvpn controller is not installed: $VPNCTL" >&2; exit 1; }
+  acct=$(account) || { echo 'No TU Wien account given.' >&2; exit 1; }
+  pass=$(/usr/bin/security find-generic-password -w -a "$acct" -s "$PASS_SERVICE" 2>/dev/null) \
+    || { echo "TUvpn: password not found in Keychain for $acct (run: tuvpn doctor)" >&2; exit 1; }
+  seed=$(/usr/bin/security find-generic-password -w -a "$acct" -s "$TOTP_SERVICE" 2>/dev/null) \
+    || { echo "TUvpn: TOTP seed not found in Keychain for $acct (run: tuvpn doctor)" >&2; exit 1; }
+  printf '%s\n%s\n%s\n' "$acct" "$pass" "$seed" | "$SUDO" "$VPNCTL" "$@"
+}
+
 case "${1:-help}" in
   connect|split)
-    run_ctl connect
+    run_with_creds connect
+    ;;
+  reconnect)
+    run_with_creds reconnect
     ;;
   full)
     echo "Full tunnel mode has been removed; only split tunnel is supported." >&2
     exit 2
     ;;
+  doctor)
+    run_ctl doctor
+    if acct=$(account); then
+      echo "password_keychain=$(/usr/bin/security find-generic-password -a "$acct" -s "$PASS_SERVICE" >/dev/null 2>&1 && echo present || echo missing)"
+      echo "totp_keychain=$(/usr/bin/security find-generic-password -a "$acct" -s "$TOTP_SERVICE" >/dev/null 2>&1 && echo present || echo missing)"
+    else
+      echo 'password_keychain=unknown (no account set)'
+      echo 'totp_keychain=unknown (no account set)'
+    fi
+    ;;
   disconnect|stop)
     run_ctl disconnect
-    ;;
-  reconnect)
-    run_ctl reconnect
     ;;
   nudge)
     run_ctl nudge
@@ -51,9 +85,6 @@ case "${1:-help}" in
     ;;
   debug)
     run_ctl debug
-    ;;
-  doctor)
-    run_ctl doctor
     ;;
   repair-dns)
     run_ctl repair-dns

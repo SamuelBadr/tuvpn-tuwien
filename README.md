@@ -10,18 +10,19 @@ your password and TOTP seed stay in your own macOS Keychain.
 - The TU Wien openconnect build at `/usr/local/libexec/tuwien-openconnect-9.21/`
   (bin + `scripts/vpnc-script`). Install it first; the script currently
   hardcodes that path.
-- `~/bin` on `PATH` (or symlink `~/.local/bin/tuvpn` yourself)
+- `~/.local/bin` on `PATH` (openconnect is invoked by root, unprivileged bits go
+  to `~/.local/bin`).
 
 ## Setup
 
 ```bash
 git clone https://github.com/SamuelBadr/tuvpn-tuwien.git
 cd tuvpn-tuwien
-./install.sh                     # copies both files into place (asks for sudo)
+./install.sh                     # sudo only for the /usr/local/sbin controller
 ```
 
 Store your own secrets in your Keychain — never commit these (use your own
-account name; `tuvpn` will also ask for it if you don't export it):
+account name; `tuvpn` will ask for it if `TUWIEN_CUID` isn't exported):
 
 ```bash
 security add-generic-password -a "you@tuwien.ac.at" -s "TUWien VPN Password" -w
@@ -53,9 +54,16 @@ tuvpn logs            Recent OpenConnect output
 
 ## Notes
 
-- `tuvpn` prompts for your account name when `TUWIEN_CUID` isn't exported;
-  export it to skip the prompt (e.g. `export TUWIEN_CUID=you@tuwien.ac.at` in
-  `~/.zshrc`).
+- `tuvpn` resolves your account (`TUWIEN_CUID` or a prompt) and reads the
+  password + TOTP seed from your *login* Keychain as the unprivileged user,
+  then hands them to the privileged controller over stdin. They never appear in
+  command lines, the environment, or on disk; install your own secrets with
+  `tuvpn doctor` guiding you.
 - If any command reports *timed out waiting for lock*, a watchdog is wedged
-  (held the lock past its timeout); `disconnect`/`connect` now stop it
-  automatically.
+  (held the lock past its timeout); `disconnect`/`connect` stop it automatically
+  when the lock is still its own.
+- `tuvpn` cannot be run through `sudo` directly for `connect`: run it as your
+  normal user so the Keychain can be read.
+- A launchd agent on the author's machine runs `tuwien-vpnctl watchdog` every
+  30s to auto-reconnect after drops. The watchdog lives in the controller; the
+  agent itself is machine-local and not part of this repo.
