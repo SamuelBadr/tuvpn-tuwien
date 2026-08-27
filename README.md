@@ -15,7 +15,7 @@ your password and TOTP seed stay in your own macOS Keychain.
 ## Setup
 
 ```bash
-git clone git@github.com:SamuelBadr/tuvpn-tuwien.git
+git clone https://github.com/SamuelBadr/tuvpn-tuwien.git
 cd tuvpn-tuwien
 ./install.sh                     # copies both files into place (asks for sudo)
 ```
