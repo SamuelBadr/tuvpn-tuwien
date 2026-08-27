@@ -65,5 +65,8 @@ tuvpn logs            Recent OpenConnect output
 - `tuvpn` cannot be run through `sudo` directly for `connect`: run it as your
   normal user so the Keychain can be read.
 - A launchd agent on the author's machine runs `tuwien-vpnctl watchdog` every
-  30s to auto-reconnect after drops. The watchdog lives in the controller; the
-  agent itself is machine-local and not part of this repo.
+  30s. It only nudges/recovers a session you already started: it never
+  authenticates (it runs as root, outside your Keychain). If the tunnel is gone
+  it reports `authentication-required`; run `tuvpn connect` to re-establish. The
+  watchdog lives in the controller; the agent itself is machine-local and not
+  part of this repo.

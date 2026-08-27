@@ -16,7 +16,6 @@ readonly PIDFILE='/var/run/openconnect-tuwien.pid'
 readonly DESIRED_STATE_FILE='/var/run/tuwien-vpn.desired-state'
 readonly DNS_SNAPSHOT_FILE='/var/run/tuwien-vpn.dns-snapshot'
 readonly LOCK_DIR='/var/run/tuwien-vpnctl.lock'
-readonly WATCHDOG_STATE_FILE='/var/run/tuwien-vpn.watchdog-state'
 readonly LOG_DIR='/var/run/tuwien-vpn'
 readonly LOG_FILE="$LOG_DIR/openconnect.log"
 
@@ -32,14 +31,16 @@ readonly STALE_LOCK_SECONDS=600
 readonly RESOLVE_TIMEOUT=3
 readonly RECONNECT_TIMEOUT=86400
 readonly DPD_INTERVAL=30
-# Minimum seconds between OTP-consuming watchdog reconnects, independent of the
-# failure counter. Prevents a flapping-success loop (e.g. another device kicking
-# this session) from burning OTPs every 30s and tripping an account lockout.
-readonly OTP_COOLDOWN=120
 
 readonly FALLBACK_SERVICE='Wi-Fi'
-readonly FALLBACK_DNS_SERVERS='empty'
 readonly PUBLIC_DNS_SERVERS='192.168.0.1 1.1.1.1 8.8.8.8'
+
+# Credentials for one connect/reconnect run, set once from stdin by
+# read_credentials() and reused by every openconnect_cmd call (including the
+# internal retry). Shell variables only - never argv, environment, or files.
+USER_EMAIL=''
+TUW_PASS=''
+TUW_SEED=''
 
 log() { printf '%s\n' "$*" >&2; }
 usage() { echo "usage: $0 {status|debug|desired-state|connect|disconnect|reconnect|nudge|repair-dns|watchdog|doctor|logs}" >&2; }
@@ -115,7 +116,13 @@ with_lock() {
   done
 
   printf '%s\n' "$$" > "$LOCK_DIR/pid" 2>/dev/null || true
-  trap 'rm -rf "$LOCK_DIR" >/dev/null 2>&1 || true' EXIT INT TERM
+  trap 'rm -rf "$LOCK_DIR" >/dev/null 2>&1 || true' EXIT
+  # INT/TERM must actually terminate this process (its EXIT trap then removes
+  # the lock); otherwise a wedged watchdog could drop its lock and keep running,
+  # and the TERM -> wait-for-death -> re-read-owner recovery below would see a
+  # lock removed for a process that never died.
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   "$@"
 }
 
@@ -193,7 +200,7 @@ save_pre_vpn_dns() {
 
 restore_dns_snapshot_or_fallback() {
   local service dns_line
-  local -a dns_servers fallback_servers
+  local -a dns_servers
 
   if [[ -r "$DNS_SNAPSHOT_FILE" ]]; then
     service=$(awk -F= '/^service=/{print $2; exit}' "$DNS_SNAPSHOT_FILE" 2>/dev/null || true)
@@ -216,13 +223,11 @@ restore_dns_snapshot_or_fallback() {
 
   service=$(primary_service || true)
   [[ -n "$service" ]] || service=$FALLBACK_SERVICE
-  if [[ "$FALLBACK_DNS_SERVERS" == empty ]]; then
+  # No snapshot: leave ordinary DNS alone, and only clear DNS that still looks
+  # like stale TU VPN DNS (e.g. left behind by an unclean VPN death).
+  if dns_looks_like_vpn_dns "$(configured_dns_servers)"; then
     networksetup -setdnsservers "$service" empty >/dev/null 2>&1 || true
-    return 0
   fi
-  # shellcheck disable=SC2206 # Intentional split: configurable space-separated DNS server list.
-  fallback_servers=($FALLBACK_DNS_SERVERS)
-  networksetup -setdnsservers "$service" "${fallback_servers[@]}" >/dev/null 2>&1 || true
 }
 
 find_vpn_iface() { route -n get "$VPN_DNS_IP" 2>/dev/null | awk -F': ' '/interface:/{print $2; exit}'; }
@@ -481,22 +486,27 @@ verify_split_tunnel() {
   return 1
 }
 
-openconnect_cmd() {
-  local pass seed token_secret rc
-  # Credentials arrive on stdin (line 1 account, line 2 password, line 3 TOTP
-  # seed), fed by the unprivileged tuvpn wrapper which reads them from the login
-  # Keychain. root never reads the Keychain and secrets never enter argv, the
-  # environment, or any file.
+read_credentials() {
+  # Called once per connect/reconnect so every openconnect_cmd call (including
+  # the internal retry) has credentials. stdin: account, password, TOTP seed,
+  # fed by the unprivileged tuvpn wrapper from the login Keychain. Kept in shell
+  # variables only - never argv, environment, or files.
   IFS= read -r USER_EMAIL || true
-  IFS= read -r pass || true
-  IFS= read -r seed || true
-  [[ -n "$USER_EMAIL" && -n "$pass" && -n "$seed" ]] \
+  IFS= read -r TUW_PASS || true
+  IFS= read -r TUW_SEED || true
+  [[ -n "$USER_EMAIL" && -n "$TUW_PASS" && -n "$TUW_SEED" ]] \
     || { log 'Missing credentials on stdin (connect via tuvpn, not sudo tuwien-vpnctl).'; return 1; }
+}
+
+openconnect_cmd() {
+  local seed token_secret rc
+  [[ -n "$USER_EMAIL" && -n "$TUW_PASS" && -n "$TUW_SEED" ]] \
+    || { log 'No credentials available (run via tuvpn connect).'; return 1; }
   external_trusted || return 1
 
   # OpenConnect accepts a token secret from a file. /dev/fd/3 keeps the TOTP
   # seed out of both the filesystem and the process argument list.
-  seed=${seed//[[:space:]]/}
+  seed=${TUW_SEED//[[:space:]]/}
   while [[ "$seed" == *= ]]; do seed=${seed%=}; done
   [[ "$seed" =~ ^[A-Za-z2-7]+$ ]] || { log "Invalid Base32 TOTP seed in Keychain."; return 1; }
   while (( ${#seed} % 8 != 0 )); do seed="${seed}="; done
@@ -506,7 +516,7 @@ openconnect_cmd() {
   # Capture all OpenConnect (and vpnc-script) output to the log file so
   # `tuvpn logs` has something to show and the terminal stays quiet.
   prepare_log_file
-  if printf '%s\n' "$pass" | P11_KIT_NO_USER_CONFIG=1 "$OPENCONNECT" \
+  if printf '%s\n' "$TUW_PASS" | P11_KIT_NO_USER_CONFIG=1 "$OPENCONNECT" \
     --background \
     --pid-file="$PIDFILE" \
     --reconnect-timeout="$RECONNECT_TIMEOUT" \
@@ -532,7 +542,7 @@ openconnect_cmd() {
   fi
 
   exec 3<&-
-  unset pass seed token_secret
+  unset seed token_secret
   return "$rc"
 }
 
@@ -551,7 +561,6 @@ disconnect_impl() {
   local pid elapsed=0 preserve_desired=${PRESERVE_DESIRED_STATE:-0}
   if [[ "$preserve_desired" != 1 ]]; then
     set_desired_disconnected
-    watchdog_reset_state
   fi
 
   pid=$(pid_from_file || true)
@@ -627,33 +636,6 @@ connect_once() {
   connect_summary
 }
 
-watchdog_write_state() {
-  local failures=${1:-0} last_attempt=${2:-0} last_nudge=${3:-0} last_otp=${4:-0} nudge_failures=${5:-0}
-  {
-    printf 'failures=%s\n' "$failures"
-    printf 'last_attempt=%s\n' "$last_attempt"
-    printf 'last_nudge=%s\n' "$last_nudge"
-    printf 'last_otp=%s\n' "$last_otp"
-    printf 'nudge_failures=%s\n' "$nudge_failures"
-  } > "$WATCHDOG_STATE_FILE"
-  chmod 600 "$WATCHDOG_STATE_FILE" 2>/dev/null || true
-}
-
-watchdog_state_field() {
-  local field=$1 default=${2:-0} value
-  value=$(awk -F= -v key="$field" '$1 == key && $2 ~ /^[0-9]+$/ { print $2; exit }' \
-    "$WATCHDOG_STATE_FILE" 2>/dev/null || true)
-  printf '%s\n' "${value:-$default}"
-}
-
-watchdog_reset_state() {
-  # Preserve last_otp across a reset so the OTP cooldown survives a transient
-  # success; only failures/last_attempt/last_nudge/nudge_failures are zeroed.
-  local last_otp
-  last_otp=$(watchdog_state_field last_otp 0)
-  watchdog_write_state 0 0 0 "$last_otp" 0
-}
-
 server_reachable() {
   local host_ip
   host_ip=$(resolve_vpn_host_public_ipv4 || true)
@@ -668,7 +650,6 @@ connect_impl() {
   current_status=$(status || true)
   if [[ "$current_status" == up ]]; then
     set_desired_connected
-    watchdog_reset_state
     return 0
   fi
   set_desired_connected
@@ -678,7 +659,6 @@ connect_impl() {
   fi
 
   if connect_once; then
-    watchdog_reset_state
     if ! verify_split_tunnel; then
       disconnect_impl >/dev/null 2>&1 || true
       return 1
@@ -690,7 +670,6 @@ connect_impl() {
   repair_dns >/dev/null 2>&1 || true
   cleanup_stale_state
   if connect_once; then
-    watchdog_reset_state
     if ! verify_split_tunnel; then
       disconnect_impl >/dev/null 2>&1 || true
       return 1
@@ -714,112 +693,36 @@ nudge_impl() {
 }
 
 watchdog_impl() {
-  local current desired pid now failures last_attempt last_nudge backoff last_otp nudge_failures
-  desired=$(desired_state)
-  if [[ "$desired" != connected ]]; then
-    watchdog_reset_state
+  local pid
+  # The watchdog runs as root from launchd, without credentials, so it must
+  # never fresh-authenticate. It only guards a session the user already opened:
+  # nudge/recover while it lives, otherwise report that `tuvpn connect` is needed.
+  if [[ "$(desired_state)" != connected ]]; then
     echo idle
     return 0
   fi
 
-  current=$(status || true)
-  case "$current" in
+  case "$(status || true)" in
     up)
-      watchdog_reset_state
       echo up
-      return 0
       ;;
     degraded)
       pid=$(pid_from_file || true)
-      now=$(date +%s)
-      last_nudge=$(watchdog_state_field last_nudge 0)
-      nudge_failures=$(watchdog_state_field nudge_failures 0)
-      # Escalate to a full reconnect after 3 nudges (~6 min) without recovery;
-      # a wedged-but-alive tunnel won't fix itself with more SIGUSR2.
-      if (( nudge_failures >= 3 )); then
-        log 'TUvpn degraded for too long; restarting OpenConnect.'
-        if pid_is_openconnect "$pid"; then
-          kill -TERM "$pid" 2>/dev/null || true
-          sleep 2
-          kill -KILL "$pid" 2>/dev/null || true
-          rm -f "$PIDFILE"
-        fi
-        watchdog_write_state "$(watchdog_state_field failures 0)" \
-          "$(watchdog_state_field last_attempt 0)" 0 \
-          "$(watchdog_state_field last_otp 0)" 0
-        # Fall through to the down path below.
-      elif pid_is_openconnect "$pid" && (( now - last_nudge >= 120 )); then
+      if pid_is_openconnect "$pid"; then
         kill -USR2 "$pid" 2>/dev/null || true
-        failures=$(watchdog_state_field failures 0)
-        last_attempt=$(watchdog_state_field last_attempt 0)
-        last_otp=$(watchdog_state_field last_otp 0)
-        watchdog_write_state "$failures" "$last_attempt" "$now" "$last_otp" $((nudge_failures + 1))
         echo nudged
-        return 0
       else
         echo reconnecting
-        return 0
       fi
       ;;
-  esac
-
-  # Recover routes and volatile DNS left by an ungraceful OpenConnect exit
-  # before testing reachability; otherwise a dead full-tunnel default makes the
-  # healthy physical network appear offline forever.
-  cleanup_stale_state
-  repair_dns >/dev/null 2>&1 || true
-
-  # A fresh authentication consumes a new OTP. Never do that while genuinely
-  # offline, and cap failed unattended attempts to avoid account lockouts.
-  if ! server_reachable; then
-    echo offline
-    return 0
-  fi
-
-  now=$(date +%s)
-  failures=$(watchdog_state_field failures 0)
-  last_attempt=$(watchdog_state_field last_attempt 0)
-  last_otp=$(watchdog_state_field last_otp 0)
-
-  # OTP cooldown: rate-limit fresh-auth reconnects regardless of success/failure
-  # so a flapping-success loop cannot evade the failure cap and burn OTPs.
-  if (( now - last_otp < OTP_COOLDOWN )); then
-    echo backoff
-    return 0
-  fi
-
-  case "$failures" in
-    0) backoff=0 ;;
-    1) backoff=300 ;;
-    2) backoff=900 ;;
     *)
-      set_desired_disconnected
+      # OpenConnect is gone. Fresh authentication needs the user's Keychain, so
+      # the human must reconnect; surface it (the launchd agent can alert).
       echo authentication-required
       return 1
       ;;
   esac
-
-  if (( now - last_attempt < backoff )); then
-    echo backoff
-    return 0
-  fi
-
-  watchdog_write_state "$failures" "$now" 0 "$now"
-  if connect_once; then
-    watchdog_reset_state
-    echo reconnected
-    return 0
-  fi
-
-  failures=$((failures + 1))
-  watchdog_write_state "$failures" "$now" 0
-  if (( failures >= 3 )); then
-    set_desired_disconnected
-    echo authentication-required
-  else
-    echo retry-later
-  fi
-  return 1
+  return 0
 }
 
 doctor() {
@@ -865,9 +768,9 @@ main() {
     status) status ;;
     debug) debug_report ;;
     desired-state) desired_state ;;
-    connect) with_lock connect_impl ;;
+    connect) read_credentials && with_lock connect_impl ;;
     disconnect) with_lock disconnect_impl ;;
-    reconnect) with_lock reconnect_impl ;;
+    reconnect) read_credentials && with_lock reconnect_impl ;;
     nudge) with_lock nudge_impl ;;
     repair-dns) with_lock repair_dns ;;
     watchdog) with_lock watchdog_impl ;;
