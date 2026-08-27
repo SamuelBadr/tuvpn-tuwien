@@ -1,0 +1,819 @@
+#!/bin/bash
+set -euo pipefail
+PATH='/usr/bin:/bin:/usr/sbin:/sbin'
+export PATH
+
+# TU Wien OpenConnect control helper for macOS.
+# This file is root-owned and is the only privileged control plane used by the
+# user-facing CLI and watchdog. Keep all executable paths fixed and root-owned.
+
+readonly USER_EMAIL="${TUWIEN_CUID:-you@tuwien.ac.at}"
+readonly PASS_SERVICE='TUWien VPN Password'
+readonly TOTP_SERVICE='TUWien VPN TOTP Seed'
+readonly AUTHGROUP='1_TU_getunnelt'
+readonly HOST='vpn.tuwien.ac.at'
+readonly OPENCONNECT='/usr/local/libexec/tuwien-openconnect-9.21/bin/openconnect'
+readonly VPNC_SCRIPT='/usr/local/libexec/tuwien-openconnect-9.21/scripts/vpnc-script'
+
+readonly PIDFILE='/var/run/openconnect-tuwien.pid'
+readonly DESIRED_STATE_FILE='/var/run/tuwien-vpn.desired-state'
+readonly DNS_SNAPSHOT_FILE='/var/run/tuwien-vpn.dns-snapshot'
+readonly LOCK_DIR='/var/run/tuwien-vpnctl.lock'
+readonly WATCHDOG_STATE_FILE='/var/run/tuwien-vpn.watchdog-state'
+readonly LOG_DIR='/var/run/tuwien-vpn'
+readonly LOG_FILE="$LOG_DIR/openconnect.log"
+
+readonly VPN_DNS_IP='128.130.4.3'
+readonly VPN_DOMAIN='tuwien.ac.at'
+readonly VPN_GATEWAY_IPV4='128.131.240.4'
+readonly VPN_GATEWAY_IPV6='2001:629:8010:795::4'
+
+readonly CONNECT_TIMEOUT=30
+readonly DISCONNECT_TIMEOUT=12
+readonly LOCK_TIMEOUT=30
+readonly STALE_LOCK_SECONDS=600
+readonly RESOLVE_TIMEOUT=3
+readonly RECONNECT_TIMEOUT=86400
+readonly DPD_INTERVAL=30
+# Minimum seconds between OTP-consuming watchdog reconnects, independent of the
+# failure counter. Prevents a flapping-success loop (e.g. another device kicking
+# this session) from burning OTPs every 30s and tripping an account lockout.
+readonly OTP_COOLDOWN=120
+
+readonly FALLBACK_SERVICE='Wi-Fi'
+readonly FALLBACK_DNS_SERVERS='empty'
+readonly PUBLIC_DNS_SERVERS='192.168.0.1 1.1.1.1 8.8.8.8'
+
+log() { printf '%s\n' "$*" >&2; }
+usage() { echo "usage: $0 {status|debug|desired-state|connect|disconnect|reconnect|nudge|repair-dns|watchdog|doctor|logs}" >&2; }
+
+require_root() {
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    echo "This helper must run as root." >&2
+    exit 1
+  fi
+}
+
+with_lock() {
+  local elapsed=0 lock_mtime now age lock_pid=""
+
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    lock_pid=""
+    [[ -r "$LOCK_DIR/pid" ]] && lock_pid=$(tr -d '[:space:]' < "$LOCK_DIR/pid" 2>/dev/null || true)
+
+    # Only break the lock when its holder is provably gone: the pid it names is
+    # dead, or no pid was ever written and the lock is ancient. A lock whose pid
+    # is still alive is never removed, however old the directory mtime looks.
+    local stale="" current_pid
+    if [[ -n "$lock_pid" ]] && ! ps -p "$lock_pid" >/dev/null 2>&1; then
+      stale=1
+    elif [[ -z "$lock_pid" ]]; then
+      lock_mtime=$(stat -f %m "$LOCK_DIR" 2>/dev/null || echo 0)
+      now=$(date +%s)
+      (( now - lock_mtime > STALE_LOCK_SECONDS )) && stale=1
+    fi
+
+    if [[ -n "$stale" ]]; then
+      # CAS: re-read the pid file and only remove the lock if it still names the
+      # same dead holder, so a freshly acquired lock is never clobbered.
+      current_pid=$(tr -d '[:space:]' < "$LOCK_DIR/pid" 2>/dev/null || true)
+      if [[ "$current_pid" == "$lock_pid" ]]; then
+        log "Removing stale lock $LOCK_DIR${lock_pid:+ from pid $lock_pid}"
+        rm -rf "$LOCK_DIR" 2>/dev/null || true
+        continue
+      fi
+    fi
+
+    if (( elapsed >= LOCK_TIMEOUT )); then
+      log "Another tuwien-vpnctl operation is active${lock_pid:+ (pid $lock_pid)}; timed out waiting for lock."
+      return 1
+    fi
+
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  printf '%s\n' "$$" > "$LOCK_DIR/pid" 2>/dev/null || true
+  trap 'rm -rf "$LOCK_DIR" >/dev/null 2>&1 || true' EXIT INT TERM
+  "$@"
+}
+
+set_desired_connected() {
+  printf 'connected\n' > "$DESIRED_STATE_FILE"
+}
+set_desired_disconnected() { printf 'disconnected\n' > "$DESIRED_STATE_FILE"; }
+
+desired_state() {
+  if [[ -r "$DESIRED_STATE_FILE" ]]; then
+    tr -d '[:space:]' < "$DESIRED_STATE_FILE"
+  else
+    printf 'disconnected\n'
+  fi
+}
+
+pid_from_file() { [[ -r "$PIDFILE" ]] && tr -d '[:space:]' < "$PIDFILE"; }
+pid_is_alive() {
+  local pid=${1:-}
+  [[ "$pid" =~ ^[0-9]+$ ]] && ps -p "$pid" >/dev/null 2>&1
+}
+pid_is_openconnect() {
+  local pid=${1:-} command
+  pid_is_alive "$pid" || return 1
+  command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+  [[ "$command" == "$OPENCONNECT "* || "$command" == "$OPENCONNECT" ]] || return 1
+  [[ "$command" == *"$HOST"* ]]
+}
+
+default_iface() { route -n get 8.8.8.8 2>/dev/null | awk -F': ' '/interface:/{print $2; exit}'; }
+
+service_for_iface() {
+  local iface=${1:-} current_service=""
+  [[ -n "$iface" ]] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      "Hardware Port: "*) current_service=${line#Hardware Port: } ;;
+      "Device: $iface") printf '%s\n' "$current_service"; return 0 ;;
+    esac
+  done < <(networksetup -listallhardwareports 2>/dev/null)
+  return 1
+}
+
+primary_service() { service_for_iface "$(default_iface)" || printf '%s\n' "$FALLBACK_SERVICE"; }
+configured_dns_servers() { networksetup -getdnsservers "$(primary_service)" 2>/dev/null || true; }
+
+dns_servers_configured() {
+  local dns
+  dns=$(configured_dns_servers)
+  [[ -n "$dns" ]] && [[ "$dns" != *"There aren't any DNS Servers"* ]]
+}
+
+dns_looks_like_vpn_dns() {
+  local dns=${1:-}
+  [[ "$dns" == *"128.130.4.3"* || "$dns" == *"128.131.4.3"* || "$dns" == *"2001:629:"* ]]
+}
+
+save_pre_vpn_dns() {
+  local service dns
+  service=$(primary_service || true)
+  dns=$(configured_dns_servers | sed '/^$/d' || true)
+  [[ -n "$service" ]] || return 0
+  if [[ -z "$dns" || "$dns" == *"There aren't any DNS Servers"* ]]; then
+    dns=empty
+  elif dns_looks_like_vpn_dns "$dns"; then
+    log "Skipping DNS snapshot - already VPN DNS"
+    return 0
+  fi
+
+  {
+    printf 'service=%s\n' "$service"
+    printf '%s\n' "$dns"
+  } > "$DNS_SNAPSHOT_FILE" 2>/dev/null || true
+}
+
+restore_dns_snapshot_or_fallback() {
+  local service dns_line
+  local -a dns_servers fallback_servers
+
+  if [[ -r "$DNS_SNAPSHOT_FILE" ]]; then
+    service=$(awk -F= '/^service=/{print $2; exit}' "$DNS_SNAPSHOT_FILE" 2>/dev/null || true)
+    if [[ -n "$service" ]]; then
+      if ! networksetup -listallnetworkservices 2>/dev/null | grep -qF "$service"; then
+        log "Snapshot service '$service' no longer exists; using current primary"
+        service=$(primary_service || true)
+      fi
+    fi
+    while IFS= read -r dns_line; do
+      [[ -n "$dns_line" ]] && dns_servers+=("$dns_line")
+    done < <(sed '1d;/^$/d' "$DNS_SNAPSHOT_FILE" 2>/dev/null || true)
+    if [[ -n "$service" && ${#dns_servers[@]} -gt 0 ]]; then
+      if [[ "${dns_servers[0]}" == empty ]]; then
+        networksetup -setdnsservers "$service" empty >/dev/null 2>&1 && return 0
+      fi
+      networksetup -setdnsservers "$service" "${dns_servers[@]}" >/dev/null 2>&1 && return 0
+    fi
+  fi
+
+  service=$(primary_service || true)
+  [[ -n "$service" ]] || service=$FALLBACK_SERVICE
+  if [[ "$FALLBACK_DNS_SERVERS" == empty ]]; then
+    networksetup -setdnsservers "$service" empty >/dev/null 2>&1 || true
+    return 0
+  fi
+  # shellcheck disable=SC2206 # Intentional split: configurable space-separated DNS server list.
+  fallback_servers=($FALLBACK_DNS_SERVERS)
+  networksetup -setdnsservers "$service" "${fallback_servers[@]}" >/dev/null 2>&1 || true
+}
+
+find_vpn_iface() { route -n get "$VPN_DNS_IP" 2>/dev/null | awk -F': ' '/interface:/{print $2; exit}'; }
+vpn_healthcheck() { nc -G 2 -z "$VPN_DNS_IP" 53 >/dev/null 2>&1; }
+
+macos_resolves_vpn_host() {
+  # OpenConnect uses macOS getaddrinfo(). Bound it inside the resolver process
+  # so a stale supplemental resolver cannot hang status/debug and no helper
+  # process is orphaned when the timeout expires.
+  /usr/bin/python3 - "$HOST" "$RESOLVE_TIMEOUT" >/dev/null 2>&1 <<'PY'
+import signal
+import socket
+import sys
+
+
+def timed_out(_signum, _frame):
+    raise TimeoutError
+
+
+signal.signal(signal.SIGALRM, timed_out)
+signal.alarm(int(sys.argv[2]))
+try:
+    socket.getaddrinfo(sys.argv[1], 443)
+except (OSError, TimeoutError):
+    raise SystemExit(1)
+finally:
+    signal.alarm(0)
+PY
+}
+
+system_resolves_vpn_host() { macos_resolves_vpn_host; }
+
+resolve_vpn_host_public_ipv4() {
+  local server ip
+  for server in $PUBLIC_DNS_SERVERS; do
+    ip=$(dig +time=1 +tries=1 +short @"$server" "$HOST" A 2>/dev/null \
+      | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/{print; exit}') || true
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
+  done
+  return 1
+}
+
+vpn_dns_state_keys() {
+  printf 'list State:/Network/Service/.*/DNS\nquit\n' | scutil 2>/dev/null \
+    | awk -F'= ' '/State:\/Network\/Service\/utun[0-9]+\/DNS/{print $2}'
+}
+
+scutil_key_mentions_vpn_domain() { printf 'show %s\nquit\n' "$1" | scutil 2>/dev/null | grep -q "$VPN_DOMAIN"; }
+remove_scutil_key() { printf 'remove %s\nquit\n' "$1" | scutil >/dev/null 2>&1 || true; }
+
+clear_vpn_dns_state() {
+  # stale: remove VPN DNS only for dead utun interfaces; all: remove all TU Wien utun DNS state.
+  local mode=${1:-stale} key iface
+  vpn_dns_state_keys | while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    scutil_key_mentions_vpn_domain "$key" || continue
+    iface=${key#State:/Network/Service/}
+    iface=${iface%/DNS}
+    if [[ "$mode" == all ]] || ! ifconfig "$iface" >/dev/null 2>&1; then
+      log "Removing stale VPN DNS state: $key"
+      remove_scutil_key "$key"
+    fi
+  done
+}
+
+cleanup_stale_gateway_route() {
+  local gateway iface
+
+  # route(8) reports a cloned host destination even when traffic merely follows
+  # the normal default route. Only remove an exact entry present in the routing
+  # table; otherwise every connect incorrectly deletes a healthy cached route.
+  read -r gateway iface < <(netstat -rn -f inet 2>/dev/null \
+    | awk -v target="$VPN_GATEWAY_IPV4" '$1 == target { print $2, $4; exit }') || true
+  if [[ -n "${gateway:-}" && "${iface:-}" != utun* ]]; then
+    log "Removing stale IPv4 host route for $VPN_GATEWAY_IPV4 via $gateway on $iface"
+    route -n delete -host "$VPN_GATEWAY_IPV4" >/dev/null 2>&1 || true
+  fi
+
+  gateway=''
+  iface=''
+  read -r gateway iface < <(netstat -rn -f inet6 2>/dev/null \
+    | awk -v target="$VPN_GATEWAY_IPV6" '$1 == target { print $2, $4; exit }') || true
+  if [[ -n "${gateway:-}" && "${iface:-}" != utun* ]]; then
+    log "Removing stale IPv6 host route for $VPN_GATEWAY_IPV6 via $gateway on $iface"
+    route -n delete -inet6 -host "$VPN_GATEWAY_IPV6" >/dev/null 2>&1 || true
+  fi
+}
+
+repair_dns() {
+  clear_vpn_dns_state stale
+  restore_dns_snapshot_or_fallback
+  networksetup -setsearchdomains "$(primary_service)" empty >/dev/null 2>&1 || true
+  killall -HUP mDNSResponder >/dev/null 2>&1 || true
+}
+
+cleanup_vpnc_state() {
+  local pid=${1:-}
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  # vpnc-script keys its default-route backups in /var/run/vpnc by pid. A
+  # SIGKILL skips the disconnect hook, leaving them behind. Split mode never
+  # writes them, but sweep defensively (recycled pid, prior session, or a server
+  # that unexpectedly pushes a default route) so stale state cannot accumulate.
+  rm -f "/var/run/vpnc/defaultroute.${pid}" \
+        "/var/run/vpnc/defaultroute_ipv6.${pid}" \
+        "/var/run/vpnc/resolv.conf-backup.${pid}" 2>/dev/null || true
+}
+
+cleanup_stale_state() {
+  local pid
+  pid=$(pid_from_file || true)
+  if pid_is_openconnect "$pid"; then
+    log "Stopping stale TU Wien OpenConnect process $pid"
+    kill -KILL "$pid" 2>/dev/null || true
+    sleep 1
+  elif pid_is_alive "$pid"; then
+    log "Refusing to signal unrelated process $pid referenced by stale PID file"
+  fi
+  # A SIGKILL skips vpnc-script's disconnect hook, orphaning its /var/run/vpnc
+  # state. Sweep it so stale defaults can never survive a crash.
+  cleanup_vpnc_state "$pid"
+  rm -f "$PIDFILE"
+  cleanup_stale_gateway_route
+  clear_vpn_dns_state all
+}
+
+status() {
+  local pid iface
+  pid=$(pid_from_file || true)
+  if ! pid_is_openconnect "$pid"; then
+    echo down
+    return 1
+  fi
+
+  iface=$(find_vpn_iface || true)
+  if [[ ! "$iface" =~ ^utun[0-9]+$ ]]; then
+    echo degraded
+    return 2
+  fi
+
+  if vpn_healthcheck; then
+    echo up
+    return 0
+  fi
+
+  echo degraded
+  return 2
+}
+
+debug_report() {
+  local current_status pid iface host_ip service dns route_gateway route_iface desired snapshot_service snapshot_dns
+  current_status=$(status || true)
+  pid=$(pid_from_file || true)
+  if [[ "$current_status" == down ]]; then iface=""; else iface=$(find_vpn_iface || true); fi
+  host_ip=$(resolve_vpn_host_public_ipv4 || true)
+  service=$(primary_service || true)
+  dns=$(configured_dns_servers | tr '\n' ',' | sed 's/,$//' || true)
+  route_gateway=$(route -n get "$VPN_GATEWAY_IPV4" 2>/dev/null | awk -F': ' '/gateway:/{print $2; exit}' || true)
+  route_iface=$(route -n get "$VPN_GATEWAY_IPV4" 2>/dev/null | awk -F': ' '/interface:/{print $2; exit}' || true)
+  desired=$(desired_state)
+  snapshot_service=$(awk -F= '/^service=/{print $2; exit}' "$DNS_SNAPSHOT_FILE" 2>/dev/null || true)
+  snapshot_dns=$(sed '1d;/^$/d' "$DNS_SNAPSHOT_FILE" 2>/dev/null | tr '\n' ',' | sed 's/,$//' || true)
+
+  cat <<EOF
+status=${current_status:-down}
+desired_state=${desired:-disconnected}
+pid=${pid:-}
+iface=${iface:-}
+healthcheck=$(if vpn_healthcheck; then echo ok; else echo fail; fi)
+host_resolves=$(if system_resolves_vpn_host; then echo yes; else echo no; fi)
+host_ip_public_dns=${host_ip:-}
+primary_service=${service:-}
+primary_dns=${dns:-}
+dns_snapshot=${snapshot_service:-}:${snapshot_dns:-}
+gateway_route=${route_gateway:-}:${route_iface:-}
+vpn_dns_state_keys=$(vpn_dns_state_keys | tr '\n' ',' | sed 's/,$//')
+EOF
+}
+
+prepare_log_file() {
+  # Truncate at the start of each connect so `logs` reflects the current
+  # session. OpenConnect's stderr contains no credentials (the password is
+  # fed via stdin and the TOTP seed via /dev/fd/3), so it is safe to persist.
+  mkdir -p "$LOG_DIR" 2>/dev/null || true
+  chmod 755 "$LOG_DIR" 2>/dev/null || true
+  : > "$LOG_FILE" 2>/dev/null || true
+  chmod 600 "$LOG_FILE" 2>/dev/null || true
+}
+
+connect_summary() {
+  local pid address expires
+  pid=$(pid_from_file || true)
+  address=$(grep -m1 'Configured as ' "$LOG_FILE" 2>/dev/null \
+    | sed 's/^Configured as //; s/, with.*//' || true)
+  expires=$(grep -m1 'Session authentication will expire at ' "$LOG_FILE" 2>/dev/null \
+    | sed 's/^Session authentication will expire at //' || true)
+  printf 'TUvpn: connected\n'
+  [[ -n "$address" ]] && printf '  address: %s\n' "$address"
+  [[ -n "$expires" ]] && printf '  session expires: %s\n' "$expires"
+  [[ -n "$pid" ]] && printf '  pid: %s\n' "$pid"
+}
+
+print_recent_log() {
+  local n=${1:-30}
+  [[ -r "$LOG_FILE" ]] || return 0
+  echo '--- recent OpenConnect log ---' >&2
+  tail -n "$n" "$LOG_FILE" >&2 2>/dev/null || true
+}
+
+logs_impl() {
+  if [[ -r "$LOG_FILE" ]]; then
+    tail -n 250 "$LOG_FILE"
+  else
+    echo 'No OpenConnect log available yet.' >&2
+    return 1
+  fi
+}
+
+openconnect_cmd() {
+  local pass seed token_secret rc
+  if ! pass=$(/usr/bin/security find-generic-password -w -a "$USER_EMAIL" -s "$PASS_SERVICE" 2>/dev/null); then
+    if /usr/bin/security find-generic-password -a "$USER_EMAIL" -s "$PASS_SERVICE" >/dev/null 2>&1; then
+      log 'TUvpn: login Keychain is locked. Unlock it from the login screen or Keychain Access, then reconnect.'
+    else
+      log 'TUvpn: network password not found in Keychain. Run: tuvpn doctor'
+    fi
+    return 1
+  fi
+  if ! seed=$(/usr/bin/security find-generic-password -w -a "$USER_EMAIL" -s "$TOTP_SERVICE" 2>/dev/null); then
+    unset pass
+    if /usr/bin/security find-generic-password -a "$USER_EMAIL" -s "$TOTP_SERVICE" >/dev/null 2>&1; then
+      log 'TUvpn: login Keychain is locked. Unlock it from the login screen or Keychain Access, then reconnect.'
+    else
+      log 'TUvpn: TOTP seed not found in Keychain. Run: tuvpn doctor'
+    fi
+    return 1
+  fi
+
+  # OpenConnect accepts a token secret from a file. /dev/fd/3 keeps the TOTP
+  # seed out of both the filesystem and the process argument list.
+  seed=${seed//[[:space:]]/}
+  while [[ "$seed" == *= ]]; do seed=${seed%=}; done
+  [[ "$seed" =~ ^[A-Za-z2-7]+$ ]] || { log "Invalid Base32 TOTP seed in Keychain."; return 1; }
+  while (( ${#seed} % 8 != 0 )); do seed="${seed}="; done
+  token_secret="base32:${seed}"
+  exec 3<<<"$token_secret"
+
+  # Capture all OpenConnect (and vpnc-script) output to the log file so
+  # `tuvpn logs` has something to show and the terminal stays quiet.
+  prepare_log_file
+  if printf '%s\n' "$pass" | P11_KIT_NO_USER_CONFIG=1 "$OPENCONNECT" \
+    --background \
+    --pid-file="$PIDFILE" \
+    --reconnect-timeout="$RECONNECT_TIMEOUT" \
+    --force-dpd="$DPD_INTERVAL" \
+    --no-dtls \
+    --passwd-on-stdin \
+    --token-mode=totp \
+    --token-secret=@/dev/fd/3 \
+    --authgroup="$AUTHGROUP" \
+    --useragent="AnyConnect OpenConnect" \
+    --no-external-auth \
+    --no-proxy \
+    --csd-wrapper=/usr/bin/false \
+    --cafile=/etc/ssl/cert.pem \
+    --script="$VPNC_SCRIPT" \
+    "$@" \
+    --user "$USER_EMAIL" \
+    "$HOST" \
+    >>"$LOG_FILE" 2>&1
+  then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  exec 3<&-
+  unset pass seed token_secret
+  return "$rc"
+}
+
+wait_for_status_up() {
+  local elapsed=0 state
+  while (( elapsed < CONNECT_TIMEOUT )); do
+    state=$(status || true)
+    [[ "$state" == up ]] && return 0
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  return 1
+}
+
+disconnect_impl() {
+  local pid elapsed=0 preserve_desired=${PRESERVE_DESIRED_STATE:-0}
+  if [[ "$preserve_desired" != 1 ]]; then
+    set_desired_disconnected
+    watchdog_reset_state
+  fi
+
+  pid=$(pid_from_file || true)
+  if pid_is_openconnect "$pid"; then
+    kill -TERM "$pid" 2>/dev/null || true
+    while pid_is_openconnect "$pid" && (( elapsed < DISCONNECT_TIMEOUT )); do
+      sleep 1
+      elapsed=$((elapsed + 1))
+    done
+    if pid_is_openconnect "$pid"; then
+      log "OpenConnect pid $pid did not exit cleanly; forcing kill."
+      kill -KILL "$pid" 2>/dev/null || true
+      sleep 1
+    fi
+  elif pid_is_alive "$pid"; then
+    log "Refusing to signal unrelated process $pid referenced by PID file."
+  fi
+
+  rm -f "$PIDFILE"
+  cleanup_stale_gateway_route
+  clear_vpn_dns_state all
+  repair_dns >/dev/null 2>&1 || true
+}
+
+wait_for_pidfile() {
+  local elapsed=0
+  while [[ ! -r "$PIDFILE" ]] && (( elapsed < 10 )); do
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  [[ -r "$PIDFILE" ]]
+}
+
+connect_once() {
+  local host_ip
+  save_pre_vpn_dns
+  cleanup_stale_state
+
+  if ! system_resolves_vpn_host; then
+    log "System resolver cannot resolve $HOST; repairing DNS before connect."
+    repair_dns >/dev/null 2>&1 || true
+  fi
+
+  host_ip=$(resolve_vpn_host_public_ipv4 || true)
+  log "Connecting to $HOST..."
+  if [[ -n "$host_ip" ]] && ! system_resolves_vpn_host; then
+    log "System resolver still cannot resolve $HOST; connecting with --resolve $HOST:$host_ip."
+    if ! openconnect_cmd --resolve "${HOST}:${host_ip}"; then
+      print_recent_log
+      return 1
+    fi
+  else
+    if ! openconnect_cmd; then
+      print_recent_log
+      return 1
+    fi
+  fi
+
+  if ! wait_for_pidfile; then
+    log "OpenConnect did not write PID file within 10s"
+    print_recent_log
+    return 1
+  fi
+
+  if ! wait_for_status_up; then
+    log 'VPN did not become healthy.'
+    print_recent_log
+    return 1
+  fi
+  connect_summary
+}
+
+watchdog_write_state() {
+  local failures=${1:-0} last_attempt=${2:-0} last_nudge=${3:-0} last_otp=${4:-0} nudge_failures=${5:-0}
+  {
+    printf 'failures=%s\n' "$failures"
+    printf 'last_attempt=%s\n' "$last_attempt"
+    printf 'last_nudge=%s\n' "$last_nudge"
+    printf 'last_otp=%s\n' "$last_otp"
+    printf 'nudge_failures=%s\n' "$nudge_failures"
+  } > "$WATCHDOG_STATE_FILE"
+  chmod 600 "$WATCHDOG_STATE_FILE" 2>/dev/null || true
+}
+
+watchdog_state_field() {
+  local field=$1 default=${2:-0} value
+  value=$(awk -F= -v key="$field" '$1 == key && $2 ~ /^[0-9]+$/ { print $2; exit }' \
+    "$WATCHDOG_STATE_FILE" 2>/dev/null || true)
+  printf '%s\n' "${value:-$default}"
+}
+
+watchdog_reset_state() {
+  # Preserve last_otp across a reset so the OTP cooldown survives a transient
+  # success; only failures/last_attempt/last_nudge/nudge_failures are zeroed.
+  local last_otp
+  last_otp=$(watchdog_state_field last_otp 0)
+  watchdog_write_state 0 0 0 "$last_otp" 0
+}
+
+server_reachable() {
+  local host_ip
+  host_ip=$(resolve_vpn_host_public_ipv4 || true)
+  if system_resolves_vpn_host && nc -G 3 -z "$HOST" 443 >/dev/null 2>&1; then
+    return 0
+  fi
+  [[ -n "$host_ip" ]] && nc -G 3 -z "$host_ip" 443 >/dev/null 2>&1
+}
+
+connect_impl() {
+  local current_status
+  current_status=$(status || true)
+  if [[ "$current_status" == up ]]; then
+    set_desired_connected
+    watchdog_reset_state
+    return 0
+  fi
+  set_desired_connected
+
+  if [[ "$current_status" == degraded ]]; then
+    PRESERVE_DESIRED_STATE=1 disconnect_impl || true
+  fi
+
+  if connect_once; then
+    watchdog_reset_state
+    return 0
+  fi
+
+  log "Initial connect attempt did not become healthy; repairing DNS and retrying once."
+  repair_dns >/dev/null 2>&1 || true
+  cleanup_stale_state
+  if connect_once; then
+    watchdog_reset_state
+    return 0
+  fi
+
+  log "VPN did not become healthy within ${CONNECT_TIMEOUT}s."
+  return 1
+}
+
+nudge_impl() {
+  local pid
+  pid=$(pid_from_file || true)
+  if ! pid_is_openconnect "$pid"; then
+    log 'TUvpn is not running.'
+    return 1
+  fi
+  kill -USR2 "$pid"
+  echo nudged
+}
+
+watchdog_impl() {
+  local current desired pid now failures last_attempt last_nudge backoff last_otp nudge_failures
+  desired=$(desired_state)
+  if [[ "$desired" != connected ]]; then
+    watchdog_reset_state
+    echo idle
+    return 0
+  fi
+
+  current=$(status || true)
+  case "$current" in
+    up)
+      watchdog_reset_state
+      echo up
+      return 0
+      ;;
+    degraded)
+      pid=$(pid_from_file || true)
+      now=$(date +%s)
+      last_nudge=$(watchdog_state_field last_nudge 0)
+      nudge_failures=$(watchdog_state_field nudge_failures 0)
+      # Escalate to a full reconnect after 3 nudges (~6 min) without recovery;
+      # a wedged-but-alive tunnel won't fix itself with more SIGUSR2.
+      if (( nudge_failures >= 3 )); then
+        log 'TUvpn degraded for too long; restarting OpenConnect.'
+        if pid_is_openconnect "$pid"; then
+          kill -TERM "$pid" 2>/dev/null || true
+          sleep 2
+          kill -KILL "$pid" 2>/dev/null || true
+          rm -f "$PIDFILE"
+        fi
+        watchdog_write_state "$(watchdog_state_field failures 0)" \
+          "$(watchdog_state_field last_attempt 0)" 0 \
+          "$(watchdog_state_field last_otp 0)" 0
+        # Fall through to the down path below.
+      elif pid_is_openconnect "$pid" && (( now - last_nudge >= 120 )); then
+        kill -USR2 "$pid" 2>/dev/null || true
+        failures=$(watchdog_state_field failures 0)
+        last_attempt=$(watchdog_state_field last_attempt 0)
+        last_otp=$(watchdog_state_field last_otp 0)
+        watchdog_write_state "$failures" "$last_attempt" "$now" "$last_otp" $((nudge_failures + 1))
+        echo nudged
+        return 0
+      else
+        echo reconnecting
+        return 0
+      fi
+      ;;
+  esac
+
+  # Recover routes and volatile DNS left by an ungraceful OpenConnect exit
+  # before testing reachability; otherwise a dead full-tunnel default makes the
+  # healthy physical network appear offline forever.
+  cleanup_stale_state
+  repair_dns >/dev/null 2>&1 || true
+
+  # A fresh authentication consumes a new OTP. Never do that while genuinely
+  # offline, and cap failed unattended attempts to avoid account lockouts.
+  if ! server_reachable; then
+    echo offline
+    return 0
+  fi
+
+  now=$(date +%s)
+  failures=$(watchdog_state_field failures 0)
+  last_attempt=$(watchdog_state_field last_attempt 0)
+  last_otp=$(watchdog_state_field last_otp 0)
+
+  # OTP cooldown: rate-limit fresh-auth reconnects regardless of success/failure
+  # so a flapping-success loop cannot evade the failure cap and burn OTPs.
+  if (( now - last_otp < OTP_COOLDOWN )); then
+    echo backoff
+    return 0
+  fi
+
+  case "$failures" in
+    0) backoff=0 ;;
+    1) backoff=300 ;;
+    2) backoff=900 ;;
+    *)
+      set_desired_disconnected
+      echo authentication-required
+      return 1
+      ;;
+  esac
+
+  if (( now - last_attempt < backoff )); then
+    echo backoff
+    return 0
+  fi
+
+  watchdog_write_state "$failures" "$now" 0 "$now"
+  if connect_once; then
+    watchdog_reset_state
+    echo reconnected
+    return 0
+  fi
+
+  failures=$((failures + 1))
+  watchdog_write_state "$failures" "$now" 0
+  if (( failures >= 3 )); then
+    set_desired_disconnected
+    echo authentication-required
+  else
+    echo retry-later
+  fi
+  return 1
+}
+
+doctor() {
+  local pid command runtime_owner runtime_mode script_owner script_mode
+  runtime_owner=$(stat -f '%Su:%Sg' "$OPENCONNECT" 2>/dev/null || true)
+  runtime_mode=$(stat -f '%OLp' "$OPENCONNECT" 2>/dev/null || true)
+  script_owner=$(stat -f '%Su:%Sg' "$VPNC_SCRIPT" 2>/dev/null || true)
+  script_mode=$(stat -f '%OLp' "$VPNC_SCRIPT" 2>/dev/null || true)
+
+  echo "openconnect=$([[ -x "$OPENCONNECT" ]] && echo present || echo missing)"
+  echo "openconnect_owner=${runtime_owner:-unknown}"
+  echo "openconnect_mode=${runtime_mode:-unknown}"
+  echo "vpnc_script=$([[ -x "$VPNC_SCRIPT" ]] && echo present || echo missing)"
+  echo "vpnc_script_owner=${script_owner:-unknown}"
+  echo "vpnc_script_mode=${script_mode:-unknown}"
+  echo "password_keychain=$(/usr/bin/security find-generic-password -a "$USER_EMAIL" -s "$PASS_SERVICE" >/dev/null 2>&1 && echo present || echo missing)"
+  echo "totp_keychain=$(/usr/bin/security find-generic-password -a "$USER_EMAIL" -s "$TOTP_SERVICE" >/dev/null 2>&1 && echo present || echo missing)"
+  echo "server_reachable=$(server_reachable && echo yes || echo no)"
+  echo "status=$(status || true)"
+
+  pid=$(pid_from_file || true)
+  if pid_is_openconnect "$pid"; then
+    command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+    if [[ "$command" == *'--token-secret=base32:'* ]]; then
+      echo 'token_argument=EXPOSED'
+    else
+      echo 'token_argument=safe'
+    fi
+  else
+    echo 'token_argument=not-running'
+  fi
+}
+
+reconnect_impl() {
+  set_desired_connected
+  PRESERVE_DESIRED_STATE=1 disconnect_impl || true
+  sleep 2
+  connect_impl
+}
+
+main() {
+  require_root
+  case "${1:-}" in
+    status) status ;;
+    debug) debug_report ;;
+    desired-state) desired_state ;;
+    connect) with_lock connect_impl ;;
+    disconnect) with_lock disconnect_impl ;;
+    reconnect) with_lock reconnect_impl ;;
+    nudge) with_lock nudge_impl ;;
+    repair-dns) with_lock repair_dns ;;
+    watchdog) with_lock watchdog_impl ;;
+    doctor) doctor ;;
+    logs) logs_impl ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"

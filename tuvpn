@@ -1,0 +1,71 @@
+#!/bin/bash
+set -euo pipefail
+PATH='/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/usr/local/sbin'
+export PATH
+
+readonly VPNCTL='/usr/local/sbin/tuwien-vpnctl'
+readonly SUDO='/usr/bin/sudo'
+
+usage() {
+  cat <<'EOF'
+Usage: tuvpn COMMAND
+
+Commands:
+  connect, split     Connect using 1_TU_getunnelt (TU traffic only)
+  disconnect, stop   Disconnect cleanly and restore DNS
+  reconnect          Re-authenticate
+  nudge              Re-establish the live session without fresh MFA
+  status             Print up, degraded, or down
+  debug              Print a diagnostic report (contains no credentials)
+  doctor             Check runtime, Keychain entries, server, and secret handling
+  repair-dns         Remove stale TUvpn DNS state and restore normal DNS
+  logs               Show recent OpenConnect log output
+  help               Show this help
+EOF
+}
+
+run_ctl() {
+  [[ -x "$VPNCTL" ]] || { echo "TUvpn controller is not installed: $VPNCTL" >&2; exit 1; }
+  "$SUDO" "$VPNCTL" "$@"
+}
+
+case "${1:-help}" in
+  connect|split)
+    run_ctl connect
+    ;;
+  full)
+    echo "Full tunnel mode has been removed; only split tunnel is supported." >&2
+    exit 2
+    ;;
+  disconnect|stop)
+    run_ctl disconnect
+    ;;
+  reconnect)
+    run_ctl reconnect
+    ;;
+  nudge)
+    run_ctl nudge
+    ;;
+  status)
+    run_ctl status
+    ;;
+  debug)
+    run_ctl debug
+    ;;
+  doctor)
+    run_ctl doctor
+    ;;
+  repair-dns)
+    run_ctl repair-dns
+    ;;
+  logs)
+    run_ctl logs
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
