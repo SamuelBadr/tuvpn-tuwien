@@ -56,3 +56,6 @@ tuvpn logs            Recent OpenConnect output
 - `tuvpn` prompts for your account name when `TUWIEN_CUID` isn't exported;
   export it to skip the prompt (e.g. `export TUWIEN_CUID=you@tuwien.ac.at` in
   `~/.zshrc`).
+- If any command reports *timed out waiting for lock*, a watchdog is wedged
+  (held the lock past its timeout); `disconnect`/`connect` now stop it
+  automatically.

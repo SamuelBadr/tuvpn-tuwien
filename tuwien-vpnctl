@@ -91,6 +91,17 @@ with_lock() {
     fi
 
     if (( elapsed >= LOCK_TIMEOUT )); then
+      # A lock still held past the timeout by a watchdog invocation (a transient
+      # check that should exit in seconds) is a wedged holder, e.g. stuck in DNS
+      # repair. Break it, or every command would deadlock forever behind it.
+      if [[ -n "$lock_pid" ]] \
+          && ps -p "$lock_pid" -o command= 2>/dev/null | grep -q 'tuwien-vpnctl watchdog'; then
+        log "Lock held by wedged watchdog $lock_pid; stopping it."
+        kill -TERM "$lock_pid" 2>/dev/null || true
+        sleep 1
+        rm -rf "$LOCK_DIR" 2>/dev/null || true
+        continue
+      fi
       log "Another tuwien-vpnctl operation is active${lock_pid:+ (pid $lock_pid)}; timed out waiting for lock."
       return 1
     fi
