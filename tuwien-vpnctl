@@ -7,10 +7,12 @@ export PATH
 # This file is root-owned and is the only privileged control plane used by the
 # user-facing CLI and watchdog. Keep all executable paths fixed and root-owned.
 
-readonly USER_EMAIL="${TUWIEN_CUID:-}"
+USER_EMAIL="${TUWIEN_CUID:-}"   # not readonly: may be filled interactively by require_cuid
 
 require_cuid() {
-  [[ -n "$USER_EMAIL" ]] || { echo 'Set TUWIEN_CUID to your TU Wien account (e.g. me@tuwien.ac.at).' >&2; return 1; }
+  [[ -n "$USER_EMAIL" ]] && return 0
+  read -r -p 'TU Wien account (e.g. me@tuwien.ac.at): ' USER_EMAIL || true
+  [[ -n "$USER_EMAIL" ]]
 }
 readonly PASS_SERVICE='TUWien VPN Password'
 readonly TOTP_SERVICE='TUWien VPN TOTP Seed'
