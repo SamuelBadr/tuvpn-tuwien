@@ -2,18 +2,22 @@
 set -euo pipefail
 PATH='/usr/bin:/bin:/usr/sbin:/sbin'
 export PATH
+# Stable tool output for parsing, and no message catalogs from the user-owned
+# Homebrew tree the runtime was copied from.
+export LC_ALL=C
 
 # TU Wien OpenConnect control helper for macOS.
 # This file is root-owned and is the only privileged control plane used by the
 # user-facing CLI. Keep all executable paths fixed and root-owned.
 
+readonly SELF='/usr/local/sbin/tuwien-vpnctl'
 readonly AUTHGROUP='1_TU_getunnelt'
 readonly HOST='vpn.tuwien.ac.at'
 readonly OPENCONNECT='/usr/local/libexec/tuwien-openconnect-9.21/bin/openconnect'
 readonly VPNC_SCRIPT='/usr/local/libexec/tuwien-openconnect-9.21/scripts/vpnc-script'
 
 readonly PIDFILE='/var/run/openconnect-tuwien.pid'
-readonly LOCK_DIR='/var/run/tuwien-vpnctl.lock'
+readonly LOCK_FILE='/var/run/tuwien-vpnctl.lck'
 readonly LOG_DIR='/var/run/tuwien-vpn'
 readonly LOG_FILE="$LOG_DIR/openconnect.log"
 
@@ -25,16 +29,14 @@ readonly VPN_GATEWAY_IPV6='2001:629:8010:795::4'
 readonly CONNECT_TIMEOUT=30
 readonly DISCONNECT_TIMEOUT=12
 readonly LOCK_TIMEOUT=30
-readonly STALE_LOCK_SECONDS=600
 readonly RESOLVE_TIMEOUT=3
 readonly RECONNECT_TIMEOUT=86400
 readonly DPD_INTERVAL=30
 
-readonly PUBLIC_DNS_SERVERS='192.168.0.1 1.1.1.1 8.8.8.8'
+readonly PUBLIC_DNS_SERVERS='1.1.1.1 8.8.8.8'
 
-# Credentials for one connect run, set once from stdin by
-# read_credentials() and reused by every openconnect_cmd call (including the
-# internal retry). Shell variables only - never argv, environment, or files.
+# Credentials for one connect run, set once from stdin by read_credentials().
+# Shell variables only - never argv, environment, or files.
 USER_EMAIL=''
 TUW_PASS=''
 TUW_SEED=''
@@ -49,51 +51,15 @@ require_root() {
   fi
 }
 
+# Serialise connect/disconnect by re-running this controller under lockf(1).
+# The kernel releases the lock when that process exits, however it exits, so a
+# crashed or killed run can never leave a stale lock behind. stdin (the
+# credentials) passes through unchanged.
 with_lock() {
-  local elapsed=0 lock_mtime now lock_pid=""
-
-  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-    lock_pid=""
-    [[ -r "$LOCK_DIR/pid" ]] && lock_pid=$(tr -d '[:space:]' < "$LOCK_DIR/pid" 2>/dev/null || true)
-
-    # Only break the lock when its holder is provably gone: the pid it names is
-    # dead, or no pid was ever written and the lock is ancient. A lock whose pid
-    # is still alive is never removed, however old the directory mtime looks.
-    local stale="" current_pid
-    if [[ -n "$lock_pid" ]] && ! ps -p "$lock_pid" >/dev/null 2>&1; then
-      stale=1
-    elif [[ -z "$lock_pid" ]]; then
-      lock_mtime=$(stat -f %m "$LOCK_DIR" 2>/dev/null || echo 0)
-      now=$(date +%s)
-      (( now - lock_mtime > STALE_LOCK_SECONDS )) && stale=1
-    fi
-
-    if [[ -n "$stale" ]]; then
-      # CAS: re-read the pid file and only remove the lock if it still names the
-      # same dead holder, so a freshly acquired lock is never clobbered.
-      current_pid=$(tr -d '[:space:]' < "$LOCK_DIR/pid" 2>/dev/null || true)
-      if [[ "$current_pid" == "$lock_pid" ]]; then
-        log "Removing stale lock $LOCK_DIR${lock_pid:+ from pid $lock_pid}"
-        rm -rf "$LOCK_DIR" 2>/dev/null || true
-        continue
-      fi
-    fi
-
-    if (( elapsed >= LOCK_TIMEOUT )); then
-      log "Another tuwien-vpnctl operation is active${lock_pid:+ (pid $lock_pid)}; timed out waiting for lock."
-      return 1
-    fi
-
-    sleep 1
-    elapsed=$((elapsed + 1))
-  done
-
-  printf '%s\n' "$$" > "$LOCK_DIR/pid" 2>/dev/null || true
-  trap 'rm -rf "$LOCK_DIR" >/dev/null 2>&1 || true' EXIT
-  # INT/TERM must terminate this process so EXIT removes the lock.
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-  "$@"
+  local rc=0
+  lockf -k -t "$LOCK_TIMEOUT" "$LOCK_FILE" env TUVPN_LOCKED=1 "$SELF" "$1" || rc=$?
+  (( rc == 75 )) && log "Another tuvpn operation is still running; try again shortly."
+  return "$rc"
 }
 
 pid_from_file() { [[ -r "$PIDFILE" ]] && tr -d '[:space:]' < "$PIDFILE"; }
@@ -109,38 +75,18 @@ pid_is_openconnect() {
   [[ "$command" == *"$HOST"* ]]
 }
 
-find_vpn_iface() { route -n get "$VPN_DNS_IP" 2>/dev/null | awk -F': ' '/interface:/{print $2; exit}'; }
+route_iface() { route -n get "$1" 2>/dev/null | awk -F': ' '/interface:/{print $2; exit}'; }
 vpn_healthcheck() {
-  /usr/bin/dig +time=2 +tries=1 +short @"$VPN_DNS_IP" "$VPN_DOMAIN" A 2>/dev/null \
-    | /usr/bin/grep -Eq '^[0-9]+(\.[0-9]+){3}$'
+  dig +time=2 +tries=1 +short @"$VPN_DNS_IP" "$VPN_DOMAIN" A 2>/dev/null \
+    | grep -Eq '^[0-9]+(\.[0-9]+){3}$'
 }
 
-macos_resolves_vpn_host() {
-  # OpenConnect uses macOS getaddrinfo(). Bound it inside the resolver process
-  # so a stale supplemental resolver cannot hang status and no helper
-  # process is orphaned when the timeout expires.
-  /usr/bin/python3 - "$HOST" "$RESOLVE_TIMEOUT" >/dev/null 2>&1 <<'PY'
-import signal
-import socket
-import sys
-
-
-def timed_out(_signum, _frame):
-    raise TimeoutError
-
-
-signal.signal(signal.SIGALRM, timed_out)
-signal.alarm(int(sys.argv[2]))
-try:
-    socket.getaddrinfo(sys.argv[1], 443)
-except (OSError, TimeoutError):
-    raise SystemExit(1)
-finally:
-    signal.alarm(0)
-PY
+system_resolves_vpn_host() {
+  # OpenConnect resolves through macOS getaddrinfo(). alarm() bounds a hung
+  # resolver (e.g. a stale supplemental DNS entry) inside the one process.
+  perl -MSocket -e 'alarm shift; my ($err) = Socket::getaddrinfo(shift, 443); exit($err ? 1 : 0)' \
+    "$RESOLVE_TIMEOUT" "$HOST" >/dev/null 2>&1
 }
-
-system_resolves_vpn_host() { macos_resolves_vpn_host; }
 
 resolve_vpn_host_public_ipv4() {
   local server ip
@@ -155,27 +101,19 @@ resolve_vpn_host_public_ipv4() {
   return 1
 }
 
-vpn_dns_state_keys() {
-  printf 'list State:/Network/Service/.*/DNS\nquit\n' | scutil 2>/dev/null \
-    | awk -F'= ' '/State:\/Network\/Service\/utun[0-9]+\/DNS/{print $2}'
-}
-
-scutil_key_mentions_vpn_domain() { printf 'show %s\nquit\n' "$1" | scutil 2>/dev/null | grep -q "$VPN_DOMAIN"; }
-remove_scutil_key() { printf 'remove %s\nquit\n' "$1" | scutil >/dev/null 2>&1 || true; }
-
 clear_vpn_dns_state() {
-  # stale: remove VPN DNS only for dead utun interfaces; all: remove all TU Wien utun DNS state.
-  local mode=${1:-stale} key iface
-  vpn_dns_state_keys | while IFS= read -r key; do
-    [[ -n "$key" ]] || continue
-    scutil_key_mentions_vpn_domain "$key" || continue
-    iface=${key#State:/Network/Service/}
-    iface=${iface%/DNS}
-    if [[ "$mode" == all ]] || ! ifconfig "$iface" >/dev/null 2>&1; then
-      log "Removing stale VPN DNS state: $key"
-      remove_scutil_key "$key"
-    fi
-  done
+  # VPN DNS lives only in the utun Dynamic Store entries written by
+  # vpnc-script; the physical interface's DNS settings are never touched.
+  local key
+  printf 'list State:/Network/Service/.*/DNS\nquit\n' | scutil 2>/dev/null \
+    | awk -F'= ' '/State:\/Network\/Service\/utun[0-9]+\/DNS/{print $2}' \
+    | while IFS= read -r key; do
+        [[ -n "$key" ]] || continue
+        printf 'show %s\nquit\n' "$key" | scutil 2>/dev/null | grep -q "$VPN_DOMAIN" || continue
+        log "Removing VPN DNS state: $key"
+        printf 'remove %s\nquit\n' "$key" | scutil >/dev/null 2>&1 || true
+      done || true
+  killall -HUP mDNSResponder >/dev/null 2>&1 || true
 }
 
 cleanup_stale_gateway_route() {
@@ -201,41 +139,42 @@ cleanup_stale_gateway_route() {
   fi
 }
 
-repair_dns() {
-  # VPN DNS lives only in the utun Dynamic Store entry; never modify the user's
-  # physical-interface DNS settings.
-  clear_vpn_dns_state all
-  killall -HUP mDNSResponder >/dev/null 2>&1 || true
-}
-
-cleanup_vpnc_state() {
-  local pid=${1:-}
-  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
-  # vpnc-script keys its default-route backups in /var/run/vpnc by pid. A
-  # SIGKILL skips the disconnect hook, leaving them behind. Split mode never
-  # writes them, but sweep defensively (recycled pid, prior session, or a server
-  # that unexpectedly pushes a default route) so stale state cannot accumulate.
-  rm -f "/var/run/vpnc/defaultroute.${pid}" \
-        "/var/run/vpnc/defaultroute_ipv6.${pid}" \
-        "/var/run/vpnc/resolv.conf-backup.${pid}" 2>/dev/null || true
-}
-
-cleanup_stale_state() {
-  local pid
+stop_openconnect() {
+  local pid elapsed=0
   pid=$(pid_from_file || true)
   if pid_is_openconnect "$pid"; then
-    log "Stopping stale TU Wien OpenConnect process $pid"
-    kill -KILL "$pid" 2>/dev/null || true
-    sleep 1
+    # SIGTERM lets vpnc-script remove the tunnel's routes and DNS itself.
+    kill -TERM "$pid" 2>/dev/null || true
+    while pid_is_openconnect "$pid" && (( elapsed < DISCONNECT_TIMEOUT )); do
+      sleep 1
+      elapsed=$((elapsed + 1))
+    done
+    if pid_is_openconnect "$pid"; then
+      log "OpenConnect pid $pid did not exit cleanly; forcing kill."
+      kill -KILL "$pid" 2>/dev/null || true
+      sleep 1
+    fi
   elif pid_is_alive "$pid"; then
-    log "Refusing to signal unrelated process $pid referenced by stale PID file"
+    log "Refusing to signal unrelated process $pid referenced by PID file."
   fi
-  # A SIGKILL skips vpnc-script's disconnect hook, orphaning its /var/run/vpnc
-  # state. Sweep it so stale defaults can never survive a crash.
-  cleanup_vpnc_state "$pid"
+  # vpnc-script keys its default-route backups in /var/run/vpnc by pid, and a
+  # SIGKILL or crash skips its disconnect hook. Split mode never writes them,
+  # but sweep defensively so stale state cannot accumulate.
+  if [[ "$pid" =~ ^[0-9]+$ ]]; then
+    rm -f "/var/run/vpnc/defaultroute.${pid}" \
+          "/var/run/vpnc/defaultroute_ipv6.${pid}" \
+          "/var/run/vpnc/resolv.conf-backup.${pid}" 2>/dev/null || true
+  fi
   rm -f "$PIDFILE"
+}
+
+# Stop any session and remove whatever a crash may have left behind: routes,
+# VPN DNS state, and vpnc-script backups. disconnect is exactly this; connect
+# starts with it, so no separate repair command is needed.
+teardown() {
+  stop_openconnect
   cleanup_stale_gateway_route
-  clear_vpn_dns_state all
+  clear_vpn_dns_state
 }
 
 status() {
@@ -246,7 +185,7 @@ status() {
     return 1
   fi
 
-  iface=$(find_vpn_iface || true)
+  iface=$(route_iface "$VPN_DNS_IP" || true)
   if [[ ! "$iface" =~ ^utun[0-9]+$ ]]; then
     echo degraded
     return 2
@@ -285,10 +224,9 @@ connect_summary() {
 }
 
 print_recent_log() {
-  local n=${1:-30}
   [[ -r "$LOG_FILE" ]] || return 0
   echo '--- recent OpenConnect log ---' >&2
-  tail -n "$n" "$LOG_FILE" >&2 2>/dev/null || true
+  tail -n 30 "$LOG_FILE" >&2 2>/dev/null || true
 }
 
 logs_impl() {
@@ -326,22 +264,20 @@ external_trusted() {
 
 verify_split_tunnel() {
   # The one property this tool promises: TU traffic via the tunnel, everything
-  # else via the physical network. A couple of route-table reads, no framework.
+  # else via the physical network.
   local iface_tu iface_public
-  iface_tu=$(route -n get "$VPN_DNS_IP" 2>/dev/null | awk -F': ' '/interface:/{print $2; exit}')
-  iface_public=$(route -n get 1.1.1.1 2>/dev/null | awk -F': ' '/interface:/{print $2; exit}')
+  iface_tu=$(route_iface "$VPN_DNS_IP")
+  iface_public=$(route_iface 1.1.1.1)
   if [[ "$iface_tu" =~ ^utun[0-9]+$ ]] && [[ ! "$iface_public" =~ ^utun[0-9]+$ ]]; then
     return 0
   fi
-  log "Split-tunnel invariant failed (TU via ${iface_tu:-none}, public via ${iface_public:-none}); disconnecting."
+  log "Split-tunnel invariant failed (TU via ${iface_tu:-none}, public via ${iface_public:-none})."
   return 1
 }
 
 read_credentials() {
-  # Called once per connect so every openconnect_cmd call (including
-  # the internal retry) has credentials. stdin: account, password, TOTP seed,
-  # fed by the unprivileged tuvpn wrapper from the login Keychain. Kept in shell
-  # variables only - never argv, environment, or files.
+  # stdin: account, password, TOTP seed, fed by the unprivileged tuvpn wrapper
+  # from the login Keychain.
   IFS= read -r USER_EMAIL || true
   IFS= read -r TUW_PASS || true
   IFS= read -r TUW_SEED || true
@@ -351,23 +287,24 @@ read_credentials() {
 
 openconnect_cmd() {
   local seed token_secret rc
-  [[ -n "$USER_EMAIL" && -n "$TUW_PASS" && -n "$TUW_SEED" ]] \
-    || { log 'No credentials available (run via tuvpn connect).'; return 1; }
   external_trusted || return 1
 
-  # OpenConnect accepts a token secret from a file. /dev/fd/3 keeps the TOTP
-  # seed out of both the filesystem and the process argument list.
   seed=${TUW_SEED//[[:space:]]/}
   while [[ "$seed" == *= ]]; do seed=${seed%=}; done
   [[ "$seed" =~ ^[A-Za-z2-7]+$ ]] || { log "Invalid Base32 TOTP seed in Keychain."; return 1; }
   while (( ${#seed} % 8 != 0 )); do seed="${seed}="; done
   token_secret="base32:${seed}"
+  # OpenConnect reads the token secret from a file; /dev/fd/3 keeps the TOTP
+  # seed out of the process argument list. /bin/bash 3.2 backs the here-string
+  # with a root-only temporary file that it unlinks immediately.
   exec 3<<<"$token_secret"
 
-  # Capture all OpenConnect (and vpnc-script) output to the log file so
-  # `tuvpn logs` has something to show and the terminal stays quiet.
+  # The runtime's GnuTLS was built for Homebrew and would otherwise read its
+  # policy file and default CA bundle from the user-writable
+  # /opt/homebrew/etc/gnutls/. Use an empty policy and trust only macOS's CA
+  # bundle. Output goes to the log file so the terminal stays quiet.
   prepare_log_file
-  if printf '%s\n' "$TUW_PASS" | P11_KIT_NO_USER_CONFIG=1 "$OPENCONNECT" \
+  if printf '%s\n' "$TUW_PASS" | P11_KIT_NO_USER_CONFIG=1 GNUTLS_SYSTEM_PRIORITY_FILE=/dev/null "$OPENCONNECT" \
     --background \
     --pid-file="$PIDFILE" \
     --reconnect-timeout="$RECONNECT_TIMEOUT" \
@@ -381,6 +318,7 @@ openconnect_cmd() {
     --no-external-auth \
     --no-proxy \
     --csd-wrapper=/usr/bin/false \
+    --no-system-trust \
     --cafile=/etc/ssl/cert.pem \
     --script="$VPNC_SCRIPT" \
     "$@" \
@@ -399,83 +337,50 @@ openconnect_cmd() {
 }
 
 wait_for_status_up() {
-  local elapsed=0 state
+  local elapsed=0
   while (( elapsed < CONNECT_TIMEOUT )); do
-    state=$(status || true)
-    [[ "$state" == up ]] && return 0
+    [[ "$(status || true)" == up ]] && return 0
     sleep 1
     elapsed=$((elapsed + 1))
   done
   return 1
 }
 
-disconnect_impl() {
-  local pid elapsed=0
-
-  pid=$(pid_from_file || true)
-  if pid_is_openconnect "$pid"; then
-    kill -TERM "$pid" 2>/dev/null || true
-    while pid_is_openconnect "$pid" && (( elapsed < DISCONNECT_TIMEOUT )); do
-      sleep 1
-      elapsed=$((elapsed + 1))
-    done
-    if pid_is_openconnect "$pid"; then
-      log "OpenConnect pid $pid did not exit cleanly; forcing kill."
-      kill -KILL "$pid" 2>/dev/null || true
-      sleep 1
-    fi
-  elif pid_is_alive "$pid"; then
-    log "Refusing to signal unrelated process $pid referenced by PID file."
+# Ends either with a healthy split tunnel or with nothing left behind. There is
+# deliberately no automatic retry: each attempt spends a login (and possibly a
+# TOTP code), and repeated failures could lock the TU account.
+connect_impl() {
+  local host_ip resolve=''
+  if [[ "$(status || true)" == up ]]; then
+    echo 'TUvpn: already connected'
+    return 0
   fi
 
-  rm -f "$PIDFILE"
-  cleanup_stale_gateway_route
-  clear_vpn_dns_state all
-  repair_dns >/dev/null 2>&1 || true
-}
-
-wait_for_pidfile() {
-  local elapsed=0
-  while [[ ! -r "$PIDFILE" ]] && (( elapsed < 10 )); do
-    sleep 1
-    elapsed=$((elapsed + 1))
-  done
-  [[ -r "$PIDFILE" ]]
-}
-
-connect_once() {
-  local host_ip
-  cleanup_stale_state
+  # A degraded session (e.g. stuck reconnecting) is stopped cleanly first.
+  teardown
 
   if ! system_resolves_vpn_host; then
-    log "System resolver cannot resolve $HOST; repairing DNS before connect."
-    repair_dns >/dev/null 2>&1 || true
+    host_ip=$(resolve_vpn_host_public_ipv4 || true)
+    if [[ -n "$host_ip" ]]; then
+      log "System resolver cannot resolve $HOST; using $host_ip from public DNS."
+      resolve="--resolve=${HOST}:${host_ip}"
+    fi
   fi
 
-  host_ip=$(resolve_vpn_host_public_ipv4 || true)
   log "Connecting to $HOST..."
-  if [[ -n "$host_ip" ]] && ! system_resolves_vpn_host; then
-    log "System resolver still cannot resolve $HOST; connecting with --resolve $HOST:$host_ip."
-    if ! openconnect_cmd --resolve "${HOST}:${host_ip}"; then
-      print_recent_log
-      return 1
-    fi
-  else
-    if ! openconnect_cmd; then
-      print_recent_log
-      return 1
-    fi
-  fi
-
-  if ! wait_for_pidfile; then
-    log "OpenConnect did not write PID file within 10s"
+  if ! openconnect_cmd ${resolve:+"$resolve"}; then
     print_recent_log
+    teardown
     return 1
   fi
-
   if ! wait_for_status_up; then
-    log 'VPN did not become healthy.'
+    log "VPN did not become healthy within ${CONNECT_TIMEOUT}s; disconnecting."
     print_recent_log
+    teardown
+    return 1
+  fi
+  if ! verify_split_tunnel; then
+    teardown
     return 1
   fi
   connect_summary
@@ -483,39 +388,11 @@ connect_once() {
 
 server_reachable() {
   local host_ip
-  host_ip=$(resolve_vpn_host_public_ipv4 || true)
   if system_resolves_vpn_host && nc -G 3 -z "$HOST" 443 >/dev/null 2>&1; then
     return 0
   fi
+  host_ip=$(resolve_vpn_host_public_ipv4 || true)
   [[ -n "$host_ip" ]] && nc -G 3 -z "$host_ip" 443 >/dev/null 2>&1
-}
-
-connect_impl() {
-  if [[ "$(status || true)" == up ]]; then
-    return 0
-  fi
-
-  if connect_once; then
-    if ! verify_split_tunnel; then
-      disconnect_impl >/dev/null 2>&1 || true
-      return 1
-    fi
-    return 0
-  fi
-
-  log "Initial connect attempt did not become healthy; repairing DNS and retrying once."
-  repair_dns >/dev/null 2>&1 || true
-  cleanup_stale_state
-  if connect_once; then
-    if ! verify_split_tunnel; then
-      disconnect_impl >/dev/null 2>&1 || true
-      return 1
-    fi
-    return 0
-  fi
-
-  log "VPN did not become healthy within ${CONNECT_TIMEOUT}s."
-  return 1
 }
 
 doctor() {
@@ -552,8 +429,16 @@ main() {
   require_root
   case "${1:-}" in
     status) status ;;
-    connect) read_credentials && with_lock connect_impl ;;
-    disconnect) with_lock disconnect_impl ;;
+    connect|disconnect)
+      if [[ -z "${TUVPN_LOCKED:-}" ]]; then
+        with_lock "$1"
+      elif [[ "$1" == connect ]]; then
+        read_credentials
+        connect_impl
+      else
+        teardown
+      fi
+      ;;
     doctor) doctor ;;
     logs) logs_impl ;;
     *) usage; exit 2 ;;

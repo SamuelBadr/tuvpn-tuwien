@@ -21,7 +21,12 @@ fixed operations but cannot substitute arbitrary executables or options.
 
 OpenConnect performs normal in-process reconnection. No background supervisor
 or desired-state file is needed: explicit `connect` and `disconnect` operations
-clean up stale state at their boundaries.
+clean up stale state at their boundaries. `connect` never retries on its own:
+each attempt spends a login and a TOTP code, and a retry inside the same
+30-second window would replay the code. It either ends healthy or tears down.
+
+Concurrent operations are serialised with `lockf(1)`, whose kernel lock dies
+with the process, so there is no stale-lock recovery to get wrong.
 
 ## Crash recovery ordering
 
@@ -36,7 +41,12 @@ internet connectivity is never affected by a VPN crash.
 - Public CA validation is retained using macOS's CA bundle; there is no brittle
   leaf-certificate pin that would break at TU's next certificate renewal.
 - `P11_KIT_NO_USER_CONFIG=1` prevents root OpenConnect from loading user-selected
-  PKCS#11 modules.
+  PKCS#11 modules. The copied GnuTLS still compiles in Homebrew's
+  `/opt/homebrew/etc/gnutls/` policy file and CA bundle, both user-writable, so
+  the controller sets `GNUTLS_SYSTEM_PRIORITY_FILE=/dev/null` and passes
+  `--no-system-trust` with `--cafile=/etc/ssl/cert.pem`.
+- The controller runs with `LC_ALL=C`, so the root process never loads message
+  catalogs from the Homebrew tree.
 - Homebrew Mach-O dependencies are copied, relocated, ad-hoc signed, and
   installed root-owned. Runtime validation rejects remaining Homebrew load
   commands.

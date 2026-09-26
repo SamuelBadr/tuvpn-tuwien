@@ -1,6 +1,6 @@
 #!/bin/bash
 set -euo pipefail
-PATH='/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/usr/local/sbin'
+PATH='/usr/bin:/bin:/usr/sbin:/sbin'
 export PATH
 
 readonly VPNCTL='/usr/local/sbin/tuwien-vpnctl'
@@ -22,11 +22,11 @@ Commands:
 EOF
 }
 
+# The TU Wien account is whatever account the Keychain password item is filed
+# under, so there is nothing else to configure.
 account() {
-  [[ -n "${TUWIEN_CUID:-}" ]] && { printf '%s\n' "$TUWIEN_CUID"; return 0; }
-  local acct=""
-  read -r -p 'TU Wien account (e.g. me@tuwien.ac.at): ' acct || true
-  [[ -n "$acct" ]]
+  security find-generic-password -s "$PASS_SERVICE" 2>/dev/null \
+    | sed -n 's/^ *"acct"<blob>="\(.*\)"$/\1/p'
 }
 
 run_ctl() {
@@ -35,48 +35,38 @@ run_ctl() {
 }
 
 # Connect needs secrets from the login Keychain, which only the logged-in user
-# can read, so this wrapper resolves the account and reads password + TOTP seed
-# unprivileged, then feeds them to the privileged controller on stdin. They
-# never appear in argv, the environment, or on disk.
-run_with_creds() {
+# can read, so this wrapper reads account, password and TOTP seed unprivileged,
+# then feeds them to the privileged controller on stdin. They never appear in
+# argv, the environment, or on disk.
+connect() {
   local acct pass seed
-  [[ -x "$VPNCTL" ]] || { echo "TUvpn controller is not installed: $VPNCTL" >&2; exit 1; }
-  acct=$(account) || { echo 'No TU Wien account given.' >&2; exit 1; }
-  pass=$(/usr/bin/security find-generic-password -w -a "$acct" -s "$PASS_SERVICE" 2>/dev/null) \
+  acct=$(account)
+  [[ -n "$acct" ]] || { echo "TUvpn: no Keychain item '$PASS_SERVICE' (run: tuvpn doctor)" >&2; exit 1; }
+  pass=$(security find-generic-password -w -a "$acct" -s "$PASS_SERVICE" 2>/dev/null) \
     || { echo "TUvpn: password not found in Keychain for $acct (run: tuvpn doctor)" >&2; exit 1; }
-  seed=$(/usr/bin/security find-generic-password -w -a "$acct" -s "$TOTP_SERVICE" 2>/dev/null) \
+  seed=$(security find-generic-password -w -a "$acct" -s "$TOTP_SERVICE" 2>/dev/null) \
     || { echo "TUvpn: TOTP seed not found in Keychain for $acct (run: tuvpn doctor)" >&2; exit 1; }
-  printf '%s\n%s\n%s\n' "$acct" "$pass" "$seed" | "$SUDO" "$VPNCTL" "$@"
+  printf '%s\n%s\n%s\n' "$acct" "$pass" "$seed" | run_ctl connect
+}
+
+doctor() {
+  local acct
+  run_ctl doctor || true
+  acct=$(account)
+  if [[ -z "$acct" ]]; then
+    echo 'keychain=missing; add your items with:'
+    echo "  security add-generic-password -a you@tuwien.ac.at -s '$PASS_SERVICE' -w"
+    echo "  security add-generic-password -a you@tuwien.ac.at -s '$TOTP_SERVICE' -w"
+    return 1
+  fi
+  echo "account=$acct"
+  echo "totp_keychain=$(security find-generic-password -a "$acct" -s "$TOTP_SERVICE" >/dev/null 2>&1 && echo present || echo missing)"
 }
 
 case "${1:-help}" in
-  connect)
-    run_with_creds connect
-    ;;
-  disconnect)
-    run_ctl disconnect
-    ;;
-  status)
-    run_ctl status
-    ;;
-  doctor)
-    run_ctl doctor
-    if acct=$(account); then
-      echo "password_keychain=$(/usr/bin/security find-generic-password -a "$acct" -s "$PASS_SERVICE" >/dev/null 2>&1 && echo present || echo missing)"
-      echo "totp_keychain=$(/usr/bin/security find-generic-password -a "$acct" -s "$TOTP_SERVICE" >/dev/null 2>&1 && echo present || echo missing)"
-    else
-      echo 'password_keychain=unknown (no account set)'
-      echo 'totp_keychain=unknown (no account set)'
-    fi
-    ;;
-  logs)
-    run_ctl logs
-    ;;
-  help|-h|--help)
-    usage
-    ;;
-  *)
-    usage >&2
-    exit 2
-    ;;
+  connect) connect ;;
+  disconnect|status|logs) run_ctl "$1" ;;
+  doctor) doctor ;;
+  help|-h|--help) usage ;;
+  *) usage >&2; exit 2 ;;
 esac

@@ -123,9 +123,4 @@ visudo -cf "$SUDOERS_FILE" || { echo 'sudoers syntax check failed' >&2; exit 1; 
 
 echo
 echo 'TUvpn installed successfully.'
-echo
-echo 'Remaining manual step — add Keychain items:'
-echo "  security add-generic-password -a '$TARGET_USER@tuwien.ac.at' -s 'TUWien VPN Password' -w"
-echo "  security add-generic-password -a '$TARGET_USER@tuwien.ac.at' -s 'TUWien VPN TOTP Seed' -w"
-echo
-echo 'Then: tuvpn connect'
+echo 'Next: tuvpn doctor (it prints the Keychain commands if items are missing), then tuvpn connect'
