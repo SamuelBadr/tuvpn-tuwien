@@ -1,72 +1,71 @@
-# tuvpn — TU Wien split-tunnel VPN for macOS
+# TU Wien VPN via OpenConnect
 
-Thin wrapper around `tuwien-vpnctl`, a bash controller for the TU Wien
-OpenConnect client. Split tunnel only. **No credentials live in this repo** —
-your password and TOTP seed stay in your own macOS Keychain.
+A macOS-native replacement for Cisco Secure Client, built around OpenConnect
+9.21 and TU Wien's supported AnyConnect-compatible endpoint.
 
-## Requirements
+## Everyday commands
 
-- macOS
-- The TU Wien openconnect build at `/usr/local/libexec/tuwien-openconnect-9.21/`
-  (bin + `scripts/vpnc-script`). Install it first; the script currently
-  hardcodes that path.
-- `~/.local/bin` on `PATH` (openconnect is invoked by root, unprivileged bits go
-  to `~/.local/bin`).
+`~/.local/bin` is already on this account's `PATH`, so use:
 
-## Setup
-
-```bash
-git clone https://github.com/SamuelBadr/tuvpn-tuwien.git
-cd tuvpn-tuwien
-./install.sh                     # sudo only for the /usr/local/sbin controller
+```sh
+tuvpn connect      # 1_TU_getunnelt — only TU traffic is tunneled
+tuvpn disconnect   # clean disconnect and DNS restoration
+tuvpn status       # up, degraded, or down
+tuvpn doctor       # check runtime, Keychain, server, and secret handling
+tuvpn logs         # show current-session OpenConnect output
 ```
 
-Store your own secrets in your Keychain — never commit these (use your own
-account name; `tuvpn` will ask for it if `TUWIEN_CUID` isn't exported):
+`connect` cleans stale VPN routes/DNS before starting. `disconnect` performs the
+same cleanup, so no separate repair command or background supervisor is needed.
 
-```bash
-security add-generic-password -a "you@tuwien.ac.at" -s "TUWien VPN Password" -w
-security add-generic-password -a "you@tuwien.ac.at" -s "TUWien VPN TOTP Seed" -w
-```
+## Credentials
 
-(Keychain will prompt you to type each secret.)
+The network password and TOTP seed are stored as generic items in the macOS
+login Keychain. Apple Passwords does not expose verification codes through a
+supported automation API, so the existing TOTP setup key is mirrored into a
+Keychain item once. No password, current OTP, or TOTP seed appears in config
+files, logs, environment variables, or process arguments.
 
-Verify, then connect:
+OpenConnect receives the password over stdin and reads the TOTP seed through an
+inherited file descriptor (`/dev/fd/3`).
 
-```bash
-tuvpn doctor
-tuvpn connect
-```
+## Reconnection
 
-## Usage
+OpenConnect uses the authenticated HTTPS/CSTP tunnel and retries temporary
+transport failures, Wi-Fi changes, and sleep/wake events for up to 24 hours.
+DTLS is disabled because the current network path corrupts its packets. If the
+process dies, run `tuvpn connect`; it cleans stale routes/DNS before asking for
+MFA again.
 
-```
-tuvpn connect|split   Connect (TU traffic only)
-tuvpn disconnect      Disconnect cleanly, restore DNS
-tuvpn reconnect       Re-authenticate
-tuvpn nudge           Re-establish live session without fresh MFA
-tuvpn status          up / degraded / down
-tuvpn debug           Diagnostic report (no credentials)
-tuvpn doctor          Check runtime, Keychain, server, secret handling
-tuvpn repair-dns      Remove stale DNS state
-tuvpn logs            Recent OpenConnect output
-```
+## DNS and routing
 
-## Notes
+The bundled `vpnc-script` uses only macOS's volatile `scutil` Dynamic Store for
+VPN DNS. It never writes persistent DNS preferences with `networksetup`, so a
+crash cannot leave Wi-Fi configured permanently with unreachable TU resolvers.
 
-- `tuvpn` resolves your account (`TUWIEN_CUID` or a prompt) and reads the
-  password + TOTP seed from your *login* Keychain as the unprivileged user,
-  then hands them to the privileged controller over stdin. They never appear in
-  command lines, the environment, or on disk; install your own secrets with
-  `tuvpn doctor` guiding you.
-- If any command reports *timed out waiting for lock*, a watchdog is wedged
-  (held the lock past its timeout); `disconnect`/`connect` stop it automatically
-  when the lock is still its own.
-- `tuvpn` cannot be run through `sudo` directly for `connect`: run it as your
-  normal user so the Keychain can be read.
-- A launchd agent on the author's machine runs `tuwien-vpnctl watchdog` every
-  30s. It only nudges/recovers a session you already started: it never
-  authenticates (it runs as root, outside your Keychain). If the tunnel is gone
-  it reports `authentication-required`; run `tuvpn connect` to re-establish. The
-  watchdog lives in the controller; the agent itself is machine-local and not
-  part of this repo.
+- Split mode sends `*.tuwien.ac.at` to TU DNS and leaves ordinary traffic/DNS on
+  the physical connection.
+
+## Logs
+
+OpenConnect's output is captured to a root-owned file at
+`/var/run/tuwien-vpn/openconnect.log` (mode `0600`). The file is truncated at
+the start of each connect so `tuvpn logs` reflects the current session. It
+contains no credentials: the password travels over stdin and the TOTP seed over
+an inherited file descriptor, never via stderr.
+
+During `tuvpn connect` only a short summary is printed (assigned addresses,
+session expiry, pid). On a failed connect the last 30 log lines are shown to
+aid diagnosis.
+
+## Files
+
+- User command: `~/.local/bin/tuvpn`
+- Source/build/tests: `~/.local/share/tuwien-vpn/`
+- Root controller: `/usr/local/sbin/tuwien-vpnctl`
+- Root-owned runtime: `/usr/local/libexec/tuwien-openconnect-9.21/`
+- Root-owned session log: `/var/run/tuwien-vpn/openconnect.log`
+
+The root-owned runtime is a relocated copy of Homebrew OpenConnect and its
+libraries. This avoids executing user-writable Homebrew code through the scoped
+passwordless controller.

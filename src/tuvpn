@@ -13,14 +13,10 @@ usage() {
 Usage: tuvpn COMMAND
 
 Commands:
-  connect, split     Connect using 1_TU_getunnelt (TU traffic only)
-  disconnect, stop   Disconnect cleanly and restore DNS
-  reconnect          Re-authenticate
-  nudge              Re-establish the live session without fresh MFA
+  connect            Connect using 1_TU_getunnelt (TU traffic only)
+  disconnect         Disconnect cleanly and restore DNS
   status             Print up, degraded, or down
-  debug              Print a diagnostic report (contains no credentials)
   doctor             Check runtime, Keychain entries, server, and secret handling
-  repair-dns         Remove stale TUvpn DNS state and restore normal DNS
   logs               Show recent OpenConnect log output
   help               Show this help
 EOF
@@ -54,15 +50,14 @@ run_with_creds() {
 }
 
 case "${1:-help}" in
-  connect|split)
+  connect)
     run_with_creds connect
     ;;
-  reconnect)
-    run_with_creds reconnect
+  disconnect)
+    run_ctl disconnect
     ;;
-  full)
-    echo "Full tunnel mode has been removed; only split tunnel is supported." >&2
-    exit 2
+  status)
+    run_ctl status
     ;;
   doctor)
     run_ctl doctor
@@ -73,21 +68,6 @@ case "${1:-help}" in
       echo 'password_keychain=unknown (no account set)'
       echo 'totp_keychain=unknown (no account set)'
     fi
-    ;;
-  disconnect|stop)
-    run_ctl disconnect
-    ;;
-  nudge)
-    run_ctl nudge
-    ;;
-  status)
-    run_ctl status
-    ;;
-  debug)
-    run_ctl debug
-    ;;
-  repair-dns)
-    run_ctl repair-dns
     ;;
   logs)
     run_ctl logs
